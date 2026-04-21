@@ -8,7 +8,7 @@ export function NotFoundPage() {
       <p className="text-sm uppercase tracking-[0.3em] text-slate-500">404</p>
       <h1 className="text-3xl font-semibold text-slate-900">页面不存在</h1>
       <p className="max-w-md text-sm leading-7 text-slate-600">
-        当前路由已经接入完成，这里是兜底页面。你后续新增功能页时，只需要继续补充 route 即可。
+        这个地址没有对应的会议主页、会中工作台或会后详情页面，可以返回主工作台继续操作。
       </p>
       <Button asChild>
         <Link to="/">返回首页</Link>

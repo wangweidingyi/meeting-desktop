@@ -1,62 +1,47 @@
 import { create } from "zustand";
 
-export type MeetingItem = {
-  id: string;
-  title: string;
-  room: string;
-  time: string;
-  owner: string;
+import type { MeetingListItem } from "@/features/meetings/models";
+
+type MeetingStore = {
+  meetings: MeetingListItem[];
+  query: string;
+  setQuery: (query: string) => void;
 };
 
-type MeetingState = {
-  focusMode: boolean;
-  meetings: MeetingItem[];
-  toggleFocusMode: () => void;
-  addQuickMeeting: () => void;
-};
-
-const initialMeetings: MeetingItem[] = [
+const initialMeetings: MeetingListItem[] = [
   {
-    id: "kickoff-sync",
-    title: "产品 Kickoff",
-    room: "3F Orbit",
-    time: "09:30",
-    owner: "Mia",
+    id: "2026-04-21-product-strategy",
+    title: "产品策略例会",
+    startedAt: "2026-04-21 09:30",
+    endedAt: "2026-04-21 10:18",
+    durationLabel: "48 分钟",
+    status: "completed",
+    transcriptPreview: "围绕发布节奏、风险项和下周依赖做了集中确认。",
   },
   {
-    id: "weekly-review",
-    title: "周会复盘",
-    room: "在线会议室 A",
-    time: "13:30",
-    owner: "Ethan",
+    id: "2026-04-20-customer-review",
+    title: "客户复盘会",
+    startedAt: "2026-04-20 16:00",
+    endedAt: null,
+    durationLabel: "进行中",
+    status: "recording",
+    transcriptPreview: "正在持续接收转写和纪要增量。",
   },
   {
-    id: "design-critique",
-    title: "交互评审",
-    room: "5F Aurora",
-    time: "16:00",
-    owner: "Olivia",
+    id: "2026-04-19-engineering-sync",
+    title: "研发同步会",
+    startedAt: "2026-04-19 14:00",
+    endedAt: "2026-04-19 15:06",
+    durationLabel: "66 分钟",
+    status: "completed",
+    transcriptPreview: "明确了音频链路、会后纪要模板和历史导出要求。",
   },
 ];
 
-export const useMeetingStore = create<MeetingState>((set) => ({
-  focusMode: false,
+export const useMeetingStore = create<MeetingStore>((set) => ({
   meetings: initialMeetings,
-  toggleFocusMode: () => {
-    set((state) => ({ focusMode: !state.focusMode }));
-  },
-  addQuickMeeting: () => {
-    set((state) => ({
-      meetings: [
-        ...state.meetings,
-        {
-          id: `quick-${state.meetings.length + 1}`,
-          title: `快速站会 ${state.meetings.length - 1}`,
-          room: "Lobby Booth",
-          time: "18:15",
-          owner: "Auto Scheduler",
-        },
-      ],
-    }));
+  query: "",
+  setQuery: (query) => {
+    set({ query });
   },
 }));

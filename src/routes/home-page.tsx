@@ -1,111 +1,125 @@
-import { ArrowRight, CalendarDays, Sparkles, TimerReset } from "lucide-react";
+import { Clock3, Plus, Search, TriangleAlert } from "lucide-react";
 import { Link } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardAction,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useMeetingStore } from "@/stores/meeting-store";
 
+const statusLabelMap = {
+  completed: "已完成",
+  recording: "进行中",
+  idle: "空闲",
+  connecting: "连接中",
+  ready: "就绪",
+  paused: "已暂停",
+  stopping: "停止中",
+  error: "异常",
+} as const;
+
 export function HomePage() {
-  const focusMode = useMeetingStore((state) => state.focusMode);
-  const toggleFocusMode = useMeetingStore((state) => state.toggleFocusMode);
-  const nextMeeting = useMeetingStore((state) => state.meetings[0]);
-  const totalMeetings = useMeetingStore((state) => state.meetings.length);
+  const meetings = useMeetingStore((state) => state.meetings);
+  const query = useMeetingStore((state) => state.query);
+  const setQuery = useMeetingStore((state) => state.setQuery);
+
+  const filteredMeetings = meetings.filter((meeting) => {
+    const haystack = `${meeting.title} ${meeting.transcriptPreview}`.toLowerCase();
+    return haystack.includes(query.trim().toLowerCase());
+  });
 
   return (
     <div className="space-y-6">
-      <section className="grid gap-6 rounded-[2rem] border border-black/5 bg-white/80 p-8 shadow-sm shadow-black/5 backdrop-blur md:grid-cols-[1.4fr_0.9fr]">
+      <section className="grid gap-6 rounded-[2rem] border border-black/5 bg-white/85 p-8 shadow-sm shadow-black/5 md:grid-cols-[1.35fr_0.85fr]">
         <div className="space-y-5">
-          <Badge variant="secondary" className="gap-1 rounded-full px-3 py-1 text-xs">
-            <Sparkles className="size-3.5" />
-            Tauri v2 Desktop Starter
+          <Badge variant="secondary" className="rounded-full px-3 py-1 text-xs">
+            Windows First · Rust Runtime
           </Badge>
           <div className="space-y-3">
-            <h1 className="max-w-xl text-4xl font-semibold tracking-tight text-slate-900 md:text-5xl">
-              Meeting 已经接好 React Router、Zustand 和 shadcn/ui。
+            <h1 className="max-w-2xl text-4xl font-semibold tracking-tight text-slate-900 md:text-5xl">
+              让会议从“录下来”变成“实时可追踪、会后可沉淀”。
             </h1>
-            <p className="max-w-xl text-base leading-7 text-slate-600">
-              这个首页是一个可直接扩展的桌面应用骨架。你现在已经可以在它上面继续加会议管理、纪要、录音转写或日程同步模块。
+            <p className="max-w-2xl text-base leading-7 text-slate-600">
+              桌面端负责双路采集、MQTT 控制、UDP 音频上行、本地持久化和断线恢复；前端只展示状态、转写和纪要。
             </p>
           </div>
           <div className="flex flex-wrap gap-3">
             <Button asChild size="lg">
-              <Link to="/agenda">
-                查看今日议程
-                <ArrowRight className="size-4" />
+              <Link to="/meetings/live">
+                <Plus className="size-4" />
+                新建会议
               </Link>
             </Button>
-            <Button variant="outline" size="lg" onClick={toggleFocusMode}>
-              <TimerReset className="size-4" />
-              {focusMode ? "关闭专注模式" : "开启专注模式"}
+            <Button asChild variant="outline" size="lg">
+              <Link to="/meetings/2026-04-21-product-strategy">查看最近一次纪要</Link>
             </Button>
           </div>
         </div>
 
-        <Card className="border border-amber-100 bg-amber-50/80" size="sm">
+        <Card className="border border-amber-100 bg-amber-50/80">
           <CardHeader>
-            <CardTitle>下一场会议</CardTitle>
-            <CardDescription>这里的数据由 Zustand store 提供。</CardDescription>
-            <CardAction>
-              <Badge variant={focusMode ? "default" : "outline"}>
-                {focusMode ? "专注中" : "标准模式"}
-              </Badge>
-            </CardAction>
+            <CardTitle className="flex items-center gap-2">
+              <TriangleAlert className="size-4 text-amber-600" />
+              恢复提醒
+            </CardTitle>
+            <CardDescription>如果应用异常关闭，下次启动会从本地 mixed 音频继续补传。</CardDescription>
           </CardHeader>
-          <CardContent className="space-y-4">
-            <div>
-              <p className="text-3xl font-semibold text-slate-900">{nextMeeting?.time}</p>
-              <p className="mt-2 text-lg font-medium text-slate-800">{nextMeeting?.title}</p>
-              <p className="mt-1 text-sm text-slate-500">
-                {nextMeeting?.room} · Host by {nextMeeting?.owner}
-              </p>
+          <CardContent className="space-y-4 text-sm text-slate-600">
+            <div className="rounded-2xl bg-white/80 p-4 ring-1 ring-black/5">
+              检测到最近一次会议支持恢复：
+              <div className="mt-2 font-medium text-slate-900">客户复盘会</div>
+              <div className="mt-1 flex items-center gap-2 text-xs text-slate-500">
+                <Clock3 className="size-3.5" />
+                已保存本地音频、转写片段和上传 checkpoint
+              </div>
             </div>
-            <div className="rounded-2xl bg-white/80 p-4 text-sm text-slate-600 ring-1 ring-black/5">
-              今日共 {totalMeetings} 场会议，路由入口已经配置完成，你可以继续扩展日历、纪要和通知页。
-            </div>
+            <Button asChild className="w-full">
+              <Link to="/meetings/live">继续未完成会议</Link>
+            </Button>
           </CardContent>
         </Card>
       </section>
 
-      <section className="grid gap-4 md:grid-cols-3">
-        {[
-          {
-            title: "Vite + React",
-            description: "前端基础模板来自官方 create-tauri-app 的 react-ts 模板。",
-          },
-          {
-            title: "React Router",
-            description: "已配置首页、议程页和 404 页，可继续拓展桌面多页面导航。",
-          },
-          {
-            title: "shadcn/ui + Zustand",
-            description: "按钮、卡片、徽标已就绪，示例状态也已经串上。",
-          },
-        ].map((item) => (
-          <Card key={item.title} className="border border-black/5 bg-white/70" size="sm">
-            <CardHeader>
-              <CardTitle>{item.title}</CardTitle>
-              <CardDescription>{item.description}</CardDescription>
-            </CardHeader>
-          </Card>
-        ))}
+      <section className="flex flex-col gap-4 rounded-[1.5rem] border border-black/5 bg-white/80 p-5 md:flex-row md:items-center md:justify-between">
+        <div>
+          <p className="text-sm uppercase tracking-[0.22em] text-slate-500">History</p>
+          <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">会议历史</h2>
+        </div>
+        <label className="flex w-full items-center gap-3 rounded-full border border-black/8 bg-white px-4 py-3 text-sm text-slate-500 md:max-w-sm">
+          <Search className="size-4" />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索会议标题或转写内容"
+            className="w-full border-0 bg-transparent text-slate-900 outline-none placeholder:text-slate-400"
+          />
+        </label>
       </section>
 
-      <section className="rounded-[1.5rem] border border-dashed border-slate-300 bg-white/60 p-6 text-sm text-slate-600">
-        <div className="flex items-center gap-2 font-medium text-slate-900">
-          <CalendarDays className="size-4" />
-          下一步建议
-        </div>
-        <p className="mt-3 leading-7">
-          你可以继续把这套骨架扩展成会议预约、AI 纪要、设备联动或多人协同桌面应用。当前目录结构已经足够支持继续迭代。
-        </p>
+      <section className="grid gap-4">
+        {filteredMeetings.map((meeting) => (
+          <Link key={meeting.id} to={`/meetings/${meeting.id}`} className="block">
+            <Card className="border border-black/5 bg-white/80 transition-transform hover:-translate-y-0.5 hover:shadow-sm">
+              <CardHeader>
+                <div className="flex items-start justify-between gap-4">
+                  <div className="space-y-2">
+                    <CardTitle>{meeting.title}</CardTitle>
+                    <CardDescription>
+                      {meeting.startedAt}
+                      {meeting.endedAt ? ` · ${meeting.endedAt}` : " · 未结束"}
+                    </CardDescription>
+                  </div>
+                  <Badge variant={meeting.status === "recording" ? "default" : "outline"}>
+                    {statusLabelMap[meeting.status]}
+                  </Badge>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-2">
+                <div className="text-sm font-medium text-slate-900">{meeting.durationLabel}</div>
+                <p className="text-sm leading-6 text-slate-600">{meeting.transcriptPreview}</p>
+              </CardContent>
+            </Card>
+          </Link>
+        ))}
       </section>
     </div>
   );
