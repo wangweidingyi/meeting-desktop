@@ -13,4 +13,10 @@ impl EventBus {
         events.push(event);
         Ok(())
     }
+
+    #[cfg(test)]
+    pub fn snapshot(&self) -> Result<Vec<RuntimeEvent>, String> {
+        let events = self.events.lock().map_err(|error| error.to_string())?;
+        Ok(events.clone())
+    }
 }
