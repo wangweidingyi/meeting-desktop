@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioFormat {
     pub encoding: String,
     pub sample_rate: u32,
@@ -8,19 +9,23 @@ pub struct AudioFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionHelloPayload {
     pub audio: AudioFormat,
     pub transport: TransportSelection,
     pub features: FeatureFlags,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TransportSelection {
     pub control: String,
     pub audio: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct FeatureFlags {
     pub realtime_transcript: bool,
     pub realtime_summary: bool,
@@ -28,17 +33,20 @@ pub struct FeatureFlags {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ControlAckPayload {
     pub accepted: bool,
     pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordingStatePayload {
     pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct MessageEnvelope<T> {
     pub version: String,
     pub message_id: String,
@@ -47,6 +55,7 @@ pub struct MessageEnvelope<T> {
     pub session_id: String,
     pub seq: u64,
     pub sent_at: String,
+    #[serde(rename = "type")]
     pub message_type: MessageType,
     pub payload: T,
 }

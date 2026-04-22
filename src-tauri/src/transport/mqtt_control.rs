@@ -1,7 +1,13 @@
+use std::sync::Mutex;
+
 use serde::Deserialize;
 
 use crate::events::bus::EventBus;
 use crate::events::types::{RuntimeEvent, SummaryDeltaPayload, TranscriptDeltaPayload};
+use crate::protocol::messages::{
+    AudioFormat, FeatureFlags, MessageEnvelope, MessageType, SessionHelloPayload,
+    TransportSelection,
+};
 use crate::protocol::topics::{
     action_items_topic, control_reply_topic, events_topic, stt_topic, summary_topic,
 };
@@ -13,14 +19,25 @@ pub struct MqttControlConfig {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct MqttControlTransport {
+    config: MqttControlConfig,
+    state: Mutex<TransportState>,
+}
+
+#[derive(Debug, Default)]
+struct TransportState {
     connected: bool,
+    outbound_messages: Vec<String>,
+    last_error: Option<String>,
 }
 
 impl MqttControlTransport {
-    pub fn new() -> Self {
-        Self { connected: false }
+    pub fn new(config: MqttControlConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(TransportState::default()),
+        }
     }
 
     pub fn subscription_topics(config: &MqttControlConfig) -> Vec<String> {
@@ -31,6 +48,16 @@ impl MqttControlTransport {
             summary_topic(&config.client_id, &config.session_id),
             action_items_topic(&config.client_id, &config.session_id),
         ]
+    }
+
+    pub fn queued_messages(&self) -> Result<Vec<String>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.outbound_messages.clone())
+    }
+
+    fn is_connected(&self) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.connected)
     }
 
     pub fn dispatch_message(event_bus: &EventBus, raw_payload: &str) -> Result<(), String> {
@@ -67,20 +94,100 @@ impl MqttControlTransport {
 
 impl ControlTransport for MqttControlTransport {
     fn connect(&self) -> Result<(), String> {
-        let _ = self.connected;
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.connected = true;
         Ok(())
     }
 
     fn disconnect(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.connected = false;
         Ok(())
     }
 
-    fn open_session(&self) -> Result<(), String> {
+    fn open_session(&self, title: &str) -> Result<String, String> {
+        if !self.is_connected()? {
+            return Err("transport is not connected".to_string());
+        }
+
+        let payload = SessionHelloPayload {
+            audio: AudioFormat {
+                encoding: "pcm_s16le".to_string(),
+                sample_rate: 16_000,
+                channels: 1,
+            },
+            transport: TransportSelection {
+                control: "mqtt".to_string(),
+                audio: "udp".to_string(),
+            },
+            features: FeatureFlags {
+                realtime_transcript: true,
+                realtime_summary: true,
+                action_items: true,
+            },
+            title: title.to_string(),
+        };
+
+        let message = MessageEnvelope {
+            version: "v1".to_string(),
+            message_id: format!("{}-hello-{}", self.config.session_id, self.config.client_id),
+            correlation_id: None,
+            client_id: self.config.client_id.clone(),
+            session_id: self.config.session_id.clone(),
+            seq: 1,
+            sent_at: "1970-01-01T00:00:00Z".to_string(),
+            message_type: MessageType::SessionHello,
+            payload,
+        };
+
+        let serialized = serde_json::to_string(&message).map_err(|error| error.to_string())?;
+        self.send_control_message(&serialized)?;
+        Ok(serialized)
+    }
+
+    fn close_session(&self) -> Result<String, String> {
+        if !self.is_connected()? {
+            return Err("transport is not connected".to_string());
+        }
+
+        let message = serde_json::json!({
+            "version": "v1",
+            "messageId": format!("{}-close", self.config.session_id),
+            "clientId": self.config.client_id.clone(),
+            "sessionId": self.config.session_id.clone(),
+            "seq": 999_u64,
+            "sentAt": "1970-01-01T00:00:00Z",
+            "type": "session/close",
+            "payload": {}
+        })
+        .to_string();
+
+        self.send_control_message(&message)?;
+        Ok(message)
+    }
+
+    fn send_control_message(&self, payload: &str) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.connected {
+            return Err("transport is not connected".to_string());
+        }
+        state.outbound_messages.push(payload.to_string());
         Ok(())
     }
 
-    fn close_session(&self) -> Result<(), String> {
-        Ok(())
+    fn on_message(&self, event_bus: &EventBus, payload: &str) -> Result<(), String> {
+        Self::dispatch_message(event_bus, payload)
+    }
+
+    fn on_error(&self, event_bus: &EventBus, message: &str) -> Result<(), String> {
+        {
+            let mut state = self.state.lock().map_err(|error| error.to_string())?;
+            state.last_error = Some(message.to_string());
+        }
+
+        event_bus.publish(RuntimeEvent::TransportError {
+            message: message.to_string(),
+        })
     }
 }
 
@@ -121,6 +228,7 @@ where
 mod tests {
     use crate::events::bus::EventBus;
     use crate::events::types::RuntimeEvent;
+    use crate::transport::control_transport::ControlTransport;
 
     use super::{MqttControlConfig, MqttControlTransport};
 
@@ -169,6 +277,41 @@ mod tests {
                     is_final: false,
                 }
             )]
+        );
+    }
+
+    #[test]
+    fn open_session_serializes_hello_envelope_and_queues_it() {
+        let transport = MqttControlTransport::new(MqttControlConfig {
+            client_id: "client-a".to_string(),
+            session_id: "session-1".to_string(),
+        });
+
+        transport.connect().unwrap();
+        let hello = transport.open_session("架构评审会").unwrap();
+
+        assert!(hello.contains("\"type\":\"session/hello\""));
+        assert!(hello.contains("\"title\":\"架构评审会\""));
+        assert_eq!(transport.queued_messages().unwrap(), vec![hello]);
+    }
+
+    #[test]
+    fn on_error_emits_transport_error_event() {
+        let transport = MqttControlTransport::new(MqttControlConfig {
+            client_id: "client-a".to_string(),
+            session_id: "session-1".to_string(),
+        });
+        let event_bus = EventBus::default();
+
+        transport
+            .on_error(&event_bus, "broker connection lost")
+            .unwrap();
+
+        assert_eq!(
+            event_bus.snapshot().unwrap(),
+            vec![RuntimeEvent::TransportError {
+                message: "broker connection lost".to_string(),
+            }]
         );
     }
 }
