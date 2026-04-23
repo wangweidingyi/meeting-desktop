@@ -98,18 +98,39 @@ describe("HomePage", () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText(/检测到最近一次会议支持恢复/i)).toBeInTheDocument();
+      expect(screen.getByText(/继续上次会议/i)).toBeInTheDocument();
       expect(screen.getAllByText("客户复盘会").length).toBeGreaterThan(0);
-      expect(screen.getByRole("button", { name: /继续未完成会议/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /恢复会议/i })).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /继续未完成会议/i }));
+    fireEvent.click(screen.getByRole("button", { name: /恢复会议/i }));
 
     await waitFor(() => {
       expect(commandMocks.resumeRecoverableMeetingMock).toHaveBeenCalledWith("meeting-1");
       expect(commandMocks.getMeetingDetailMock).toHaveBeenCalledWith("meeting-1");
       expect(useSessionViewStore.getState().transcript[0].text).toBe("恢复后的转写内容");
       expect(useSessionViewStore.getState().summary.abstract).toBe("恢复后的纪要摘要");
+    });
+  });
+
+  it("renders the desktop-style quick action workspace", async () => {
+    commandMocks.listRecoverableMeetingsMock.mockResolvedValue([]);
+    commandMocks.listMeetingHistoryMock.mockResolvedValue([]);
+
+    render(
+      <MemoryRouter>
+        <HomePage />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("开始会议")).toBeInTheDocument();
+      expect(screen.getByText("继续上次会议")).toBeInTheDocument();
+      expect(screen.getByText("历史记录")).toBeInTheDocument();
+      expect(screen.getByText("最近纪要")).toBeInTheDocument();
+      expect(screen.getByText("今天")).toBeInTheDocument();
+      expect(screen.getByText("暂无会议")).toBeInTheDocument();
+      expect(screen.getByText("暂时没有会议安排，开始一场新的会议吧。")).toBeInTheDocument();
     });
   });
 
