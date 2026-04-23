@@ -5,9 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:local": "node ./scripts/run-local-dev.mjs",
+    "backend:run": "node ./scripts/run-backend-local.mjs",
     "build": "tsc && vite build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:desktop-rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:desktop-network": "cargo test --manifest-path src-tauri/Cargo.toml -- --ignored --test-threads=1",
+    "test:desktop-smoke": "cargo test --manifest-path src-tauri/Cargo.toml --test session_smoke",
+    "test:backend-integration": "cd ../meeting-server && go test ./test/integration",
     "preview": "vite preview",
     "tauri": "tauri"
   },

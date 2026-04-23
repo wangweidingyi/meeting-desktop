@@ -5,5 +5,5 @@ export type TranscriptSegmentView = {
   text: string;
   isFinal: boolean;
   speakerId: string | null;
+  revision: number;
 };
-

@@ -4,6 +4,8 @@ export type SummarySection = {
 };
 
 export type SummaryViewState = {
+  version: number;
+  isFinal: boolean;
   abstract: string;
   keyPoints: SummarySection;
   decisions: SummarySection;
@@ -11,4 +13,3 @@ export type SummaryViewState = {
   actionItems: SummarySection;
   lastUpdatedLabel: string;
 };
-

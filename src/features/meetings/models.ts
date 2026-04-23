@@ -18,3 +18,13 @@ export type MeetingListItem = {
   transcriptPreview: string;
 };
 
+import type { DesktopMeetingRecord } from "@/features/session/models";
+import type { SummaryViewState } from "@/features/summary/models";
+import type { TranscriptSegmentView } from "@/features/transcript/models";
+
+export type MeetingDetailView = {
+  meeting: DesktopMeetingRecord;
+  transcriptSegments: TranscriptSegmentView[];
+  summary: SummaryViewState;
+  actionItems: string[];
+};

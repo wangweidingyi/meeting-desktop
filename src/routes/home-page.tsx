@@ -1,10 +1,14 @@
 import { Clock3, Plus, Search, TriangleAlert } from "lucide-react";
-import { Link } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { useMeetingStore } from "@/stores/meeting-store";
+import type { DesktopMeetingRecord } from "@/features/session/models";
+import { useMeetingHistory } from "@/features/meetings/hooks/use-meeting-history";
+import { getMeetingDetail, listRecoverableMeetings, resumeRecoverableMeeting } from "@/lib/api/commands";
+import { useSessionViewStore } from "@/lib/state/session-view-store";
 
 const statusLabelMap = {
   completed: "已完成",
@@ -18,9 +22,52 @@ const statusLabelMap = {
 } as const;
 
 export function HomePage() {
-  const meetings = useMeetingStore((state) => state.meetings);
-  const query = useMeetingStore((state) => state.query);
-  const setQuery = useMeetingStore((state) => state.setQuery);
+  const navigate = useNavigate();
+  const { meetings, isLoading, error } = useMeetingHistory();
+  const [query, setQuery] = useState("");
+  const [recoverableMeeting, setRecoverableMeeting] = useState<DesktopMeetingRecord | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+
+    void listRecoverableMeetings()
+      .then((meetings) => {
+        if (disposed) {
+          return;
+        }
+
+        setRecoverableMeeting(meetings[0] ?? null);
+      })
+      .catch(() => {
+        if (!disposed) {
+          setRecoverableMeeting(null);
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const handleResumeRecoverableMeeting = async () => {
+    if (!recoverableMeeting) {
+      return;
+    }
+
+    const meeting = await resumeRecoverableMeeting(recoverableMeeting.id);
+    const store = useSessionViewStore.getState();
+
+    store.syncFromMeetingRecord(meeting);
+
+    try {
+      const detail = await getMeetingDetail(recoverableMeeting.id);
+      useSessionViewStore.getState().hydrateRecoveredMeetingDetail(detail);
+    } catch {
+      // If detail hydration fails, keep the recovered runtime shell so the live page can still reconnect.
+    }
+
+    navigate("/meetings/live");
+  };
 
   const filteredMeetings = meetings.filter((meeting) => {
     const haystack = `${meeting.title} ${meeting.transcriptPreview}`.toLowerCase();
@@ -65,16 +112,22 @@ export function HomePage() {
           </CardHeader>
           <CardContent className="space-y-4 text-sm text-slate-600">
             <div className="rounded-2xl bg-white/80 p-4 ring-1 ring-black/5">
-              检测到最近一次会议支持恢复：
-              <div className="mt-2 font-medium text-slate-900">客户复盘会</div>
+              {recoverableMeeting ? "检测到最近一次会议支持恢复：" : "当前没有未完成会议。"}
+              {recoverableMeeting ? (
+                <div className="mt-2 font-medium text-slate-900">{recoverableMeeting.title}</div>
+              ) : null}
               <div className="mt-1 flex items-center gap-2 text-xs text-slate-500">
                 <Clock3 className="size-3.5" />
-                已保存本地音频、转写片段和上传 checkpoint
+                {recoverableMeeting
+                  ? "已保存本地音频、转写片段和上传 checkpoint"
+                  : "一旦异常退出，后续会根据 checkpoint 和 mixed 音频生成恢复计划"}
               </div>
             </div>
-            <Button asChild className="w-full">
-              <Link to="/meetings/live">继续未完成会议</Link>
-            </Button>
+            {recoverableMeeting ? (
+              <Button className="w-full" onClick={() => void handleResumeRecoverableMeeting()}>
+                继续未完成会议
+              </Button>
+            ) : null}
           </CardContent>
         </Card>
       </section>
@@ -96,30 +149,56 @@ export function HomePage() {
       </section>
 
       <section className="grid gap-4">
-        {filteredMeetings.map((meeting) => (
-          <Link key={meeting.id} to={`/meetings/${meeting.id}`} className="block">
-            <Card className="border border-black/5 bg-white/80 transition-transform hover:-translate-y-0.5 hover:shadow-sm">
-              <CardHeader>
-                <div className="flex items-start justify-between gap-4">
-                  <div className="space-y-2">
-                    <CardTitle>{meeting.title}</CardTitle>
-                    <CardDescription>
-                      {meeting.startedAt}
-                      {meeting.endedAt ? ` · ${meeting.endedAt}` : " · 未结束"}
-                    </CardDescription>
-                  </div>
-                  <Badge variant={meeting.status === "recording" ? "default" : "outline"}>
-                    {statusLabelMap[meeting.status]}
-                  </Badge>
-                </div>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <div className="text-sm font-medium text-slate-900">{meeting.durationLabel}</div>
-                <p className="text-sm leading-6 text-slate-600">{meeting.transcriptPreview}</p>
-              </CardContent>
-            </Card>
-          </Link>
-        ))}
+        {isLoading ? (
+          <Card className="border border-dashed border-black/10 bg-white/70">
+            <CardContent className="py-8 text-sm text-slate-500">
+              正在从本地 SQLite 加载会议历史...
+            </CardContent>
+          </Card>
+        ) : null}
+
+        {!isLoading && error ? (
+          <Card className="border border-rose-100 bg-rose-50/80">
+            <CardContent className="py-8 text-sm text-rose-700">
+              会议历史加载失败：{error}
+            </CardContent>
+          </Card>
+        ) : null}
+
+        {!isLoading && !error && filteredMeetings.length === 0 ? (
+          <Card className="border border-dashed border-black/10 bg-white/70">
+            <CardContent className="py-8 text-sm text-slate-500">
+              {query ? "没有匹配的会议记录。" : "还没有会议历史，开始第一场会议吧。"}
+            </CardContent>
+          </Card>
+        ) : null}
+
+        {!isLoading && !error
+          ? filteredMeetings.map((meeting) => (
+              <Link key={meeting.id} to={`/meetings/${meeting.id}`} className="block">
+                <Card className="border border-black/5 bg-white/80 transition-transform hover:-translate-y-0.5 hover:shadow-sm">
+                  <CardHeader>
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="space-y-2">
+                        <CardTitle>{meeting.title}</CardTitle>
+                        <CardDescription>
+                          {meeting.startedAt}
+                          {meeting.endedAt ? ` · ${meeting.endedAt}` : " · 未结束"}
+                        </CardDescription>
+                      </div>
+                      <Badge variant={meeting.status === "recording" ? "default" : "outline"}>
+                        {statusLabelMap[meeting.status]}
+                      </Badge>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    <div className="text-sm font-medium text-slate-900">{meeting.durationLabel}</div>
+                    <p className="text-sm leading-6 text-slate-600">{meeting.transcriptPreview}</p>
+                  </CardContent>
+                </Card>
+              </Link>
+            ))
+          : null}
       </section>
     </div>
   );

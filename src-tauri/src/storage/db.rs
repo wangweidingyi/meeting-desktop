@@ -1,12 +1,13 @@
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
 use crate::storage::migrations;
 
+#[derive(Clone)]
 pub struct Database {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
 }
 
 impl Database {
@@ -15,17 +16,16 @@ impl Database {
         migrations::run(&connection)?;
 
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
         })
     }
 
-    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, rusqlite::Error> {
         let connection = Connection::open_in_memory()?;
         migrations::run(&connection)?;
 
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
         })
     }
 

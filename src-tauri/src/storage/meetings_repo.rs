@@ -50,6 +50,26 @@ impl MeetingsRepo {
         Ok(meetings)
     }
 
+    pub fn find_by_id(
+        connection: &Connection,
+        meeting_id: &str,
+    ) -> Result<Option<MeetingRecord>, rusqlite::Error> {
+        let mut statement = connection.prepare(
+            "
+            SELECT id, title, status, started_at, ended_at, duration_ms
+            FROM meetings
+            WHERE id = ?1
+            ",
+        )?;
+
+        let mut rows = statement.query([meeting_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+
+        parse_meeting_row(row).map(Some)
+    }
+
     pub fn list_recoverable(
         connection: &Connection,
     ) -> Result<Vec<MeetingRecord>, rusqlite::Error> {

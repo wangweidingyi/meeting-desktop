@@ -1,24 +1,61 @@
 import { Download, FileText, ListTodo } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-
-const transcriptSections = [
-  "主持人：今天先把 Windows 双路音频采集和 mixed 上行边界确认下来。",
-  "研发：Rust 侧会统一控制 MQTT、UDP、SQLite 和恢复状态机。",
-  "产品：会后导出至少支持 Markdown，行动项需要独立区块。",
-];
-
-const actionItems = [
-  "完成 Phase 1：路由、类型系统、状态机骨架、SQLite schema。",
-  "补齐 MQTT 控制协议和 UDP 音频包定义。",
-  "实现恢复时的 mixed 未上传区间补发。",
-];
+import { getMeetingDetail, exportMarkdown } from "@/lib/api/commands";
+import type { MeetingDetailView } from "@/features/meetings/models";
+import { TranscriptStreamPanel } from "@/features/transcript/components/transcript-stream-panel";
+import { LiveSummaryPanel } from "@/features/summary/components/live-summary-panel";
+import { ActionItemsPanel } from "@/features/summary/components/action-items-panel";
 
 export function MeetingDetailPage() {
   const { meetingId = "meeting" } = useParams();
+  const [detail, setDetail] = useState<MeetingDetailView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+
+    void getMeetingDetail(meetingId)
+      .then((response) => {
+        if (!disposed) {
+          setDetail(response);
+          setError(null);
+        }
+      })
+      .catch((reason) => {
+        if (!disposed) {
+          setError(String(reason));
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [meetingId]);
+
+  async function handleExportMarkdown() {
+    const markdown = await exportMarkdown(meetingId);
+    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${meetingId}.md`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleCopySummary() {
+    if (!detail?.summary.abstract) {
+      return;
+    }
+    await navigator.clipboard.writeText(detail.summary.abstract);
+  }
+
+  const meeting = detail?.meeting;
 
   return (
     <div className="space-y-6">
@@ -32,17 +69,23 @@ export function MeetingDetailPage() {
               <Badge variant="outline">{meetingId}</Badge>
             </div>
             <div>
-              <h1 className="text-3xl font-semibold tracking-tight text-slate-900">产品策略例会</h1>
-              <p className="mt-2 text-sm text-slate-500">2026-04-21 09:30 - 10:18 · 已生成最终纪要和行动项</p>
+              <h1 className="text-3xl font-semibold tracking-tight text-slate-900">
+                {meeting?.title ?? "正在加载会议详情"}
+              </h1>
+              <p className="mt-2 text-sm text-slate-500">
+                {meeting
+                  ? `${meeting.started_at}${meeting.ended_at ? ` - ${meeting.ended_at}` : " · 未结束"}`
+                  : "正在从本地 SQLite 读取会议详情"}
+              </p>
             </div>
           </div>
 
           <div className="flex flex-wrap gap-3">
-            <Button variant="outline">
+            <Button variant="outline" onClick={() => void handleCopySummary()} disabled={!detail}>
               <FileText className="size-4" />
               复制纪要
             </Button>
-            <Button>
+            <Button onClick={() => void handleExportMarkdown()} disabled={!detail}>
               <Download className="size-4" />
               导出 Markdown
             </Button>
@@ -57,12 +100,7 @@ export function MeetingDetailPage() {
             <CardDescription>转写片段会按时间顺序展示，支持后续继续编辑。</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            {transcriptSections.map((line, index) => (
-              <div key={line} className="rounded-2xl border border-black/5 bg-slate-50/80 px-4 py-3 text-sm leading-7 text-slate-700">
-                <div className="mb-1 text-xs font-medium text-slate-400">00:0{index + 1}:12</div>
-                {line}
-              </div>
-            ))}
+            <TranscriptStreamPanel segments={detail?.transcriptSegments ?? []} />
           </CardContent>
         </Card>
 
@@ -72,10 +110,21 @@ export function MeetingDetailPage() {
               <CardTitle>最终会议纪要</CardTitle>
               <CardDescription>结构化输出：摘要、决策、风险、行动项。</CardDescription>
             </CardHeader>
-            <CardContent className="space-y-4 text-sm leading-7 text-slate-600">
-              <p>会议明确以 Rust 为主控推进桌面端 runtime，React 仅做 UI 展示。</p>
-              <p>控制链路采用 MQTT，音频链路采用 UDP，首版上传 mixed 单流，双路原始 WAV 本地保存。</p>
-              <p>历史记录、崩溃恢复、Markdown 导出纳入 MVP，而 speaker diarization 和 Opus 编码后置。</p>
+            <CardContent>
+              <LiveSummaryPanel
+                summary={
+                  detail?.summary ?? {
+                    version: 0,
+                    isFinal: false,
+                    abstract: error ? `加载失败：${error}` : "尚未生成最终纪要",
+                    keyPoints: { title: "关键要点", items: [] },
+                    decisions: { title: "决策", items: [] },
+                    risks: { title: "风险", items: [] },
+                    actionItems: { title: "行动项", items: [] },
+                    lastUpdatedLabel: "尚未生成",
+                  }
+                }
+              />
             </CardContent>
           </Card>
 
@@ -86,12 +135,8 @@ export function MeetingDetailPage() {
                 行动项
               </CardTitle>
             </CardHeader>
-            <CardContent className="space-y-3">
-              {actionItems.map((item) => (
-                <div key={item} className="rounded-2xl border border-black/5 bg-slate-50/80 px-4 py-3 text-sm leading-6 text-slate-700">
-                  {item}
-                </div>
-              ))}
+            <CardContent>
+              <ActionItemsPanel items={detail?.actionItems ?? []} />
             </CardContent>
           </Card>
         </div>
