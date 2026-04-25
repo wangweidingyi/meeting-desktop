@@ -12,6 +12,17 @@ pub enum TransportConnectionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioUplinkState {
+    Idle,
+    WaitingForAudio,
+    Replaying,
+    Streaming,
+    Paused,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSnapshot {
     pub meeting: Option<MeetingRecord>,
     pub status: SessionStatus,
@@ -59,12 +70,25 @@ pub struct TransportStatePayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeDiagnosticsPayload {
+    pub session_id: String,
+    pub audio_target_addr: String,
+    pub audio_uplink_state: AudioUplinkState,
+    pub last_uploaded_mixed_ms: u64,
+    pub last_chunk_sequence: Option<u64>,
+    pub last_chunk_sent_at: Option<String>,
+    pub replay_from_ms: Option<u64>,
+    pub replay_until_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RuntimeEvent {
     SessionUpdated(SessionSnapshot),
     TranscriptDelta(TranscriptDeltaPayload),
     SummaryDelta(SummaryDeltaPayload),
     ActionItemsDelta(ActionItemsDeltaPayload),
     TransportStateChanged(TransportStatePayload),
+    RuntimeDiagnosticsUpdated(RuntimeDiagnosticsPayload),
     Heartbeat { session_id: String },
     TransportError { message: String },
 }

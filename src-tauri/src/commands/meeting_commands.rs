@@ -1,3 +1,4 @@
+use serde::Serialize;
 use tauri::State;
 
 use crate::app_state::AppState;
@@ -5,12 +6,28 @@ use crate::audio::coordinator::{AudioCoordinatorConfig, CaptureSourceKind};
 use crate::audio::platform::PlatformCaptureRuntime;
 use crate::audio::runtime::MeetingAudioRuntime;
 use crate::config::{BackendRuntimeConfig, MacosSystemAudioMode};
-use crate::events::types::{RuntimeEvent, SessionSnapshot};
+use crate::events::types::{AudioUplinkState, RuntimeEvent, SessionSnapshot};
 use crate::session::models::{MeetingRecord, SessionEvent};
 use crate::storage::meetings_repo::MeetingsRepo;
 use crate::transport::control_transport::ControlTransport;
 use crate::transport::runtime::SessionTransportFactory;
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeBackendInfo {
+    pub control_client_id: String,
+    pub current_user_id: Option<String>,
+    pub current_user_name: Option<String>,
+    pub mqtt_broker_url: Option<String>,
+    pub audio_target_addr: String,
+    pub admin_api_base_url: String,
+    pub startup_stt_provider: Option<String>,
+    pub startup_stt_model: Option<String>,
+    pub startup_stt_resource_id: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+use crate::audio::platform::macos::{MacosMicrophoneCapture, PcmFrameCallback};
 #[cfg(target_os = "windows")]
 use crate::audio::platform::windows::device_enumerator::WindowsAudioDeviceEnumerator;
 #[cfg(target_os = "windows")]
@@ -19,8 +36,6 @@ use crate::audio::platform::windows::loopback_capture::WindowsLoopbackCapture;
 use crate::audio::platform::windows::mic_capture::WindowsMicrophoneCapture;
 #[cfg(target_os = "windows")]
 use crate::audio::platform::windows::runtime_sink::build_runtime_sink;
-#[cfg(target_os = "macos")]
-use crate::audio::platform::macos::{MacosMicrophoneCapture, PcmFrameCallback};
 
 #[tauri::command]
 pub fn create_meeting(state: State<'_, AppState>, title: String) -> Result<MeetingRecord, String> {
@@ -44,6 +59,21 @@ pub fn create_meeting(state: State<'_, AppState>, title: String) -> Result<Meeti
     publish_session_snapshot(&state, Some(meeting.clone()))?;
 
     Ok(meeting)
+}
+
+#[tauri::command]
+pub fn get_runtime_backend_info(state: State<'_, AppState>) -> Result<RuntimeBackendInfo, String> {
+    Ok(RuntimeBackendInfo {
+        control_client_id: state.runtime_config.client_id.clone(),
+        current_user_id: state.runtime_config.current_user_id.clone(),
+        current_user_name: state.runtime_config.current_user_name.clone(),
+        mqtt_broker_url: state.runtime_config.mqtt_broker.clone(),
+        audio_target_addr: state.runtime_config.udp_target_addr(),
+        admin_api_base_url: state.runtime_config.admin_api_base_url(),
+        startup_stt_provider: state.runtime_config.startup_stt_provider.clone(),
+        startup_stt_model: state.runtime_config.startup_stt_model.clone(),
+        startup_stt_resource_id: state.runtime_config.startup_stt_resource_id.clone(),
+    })
 }
 
 #[tauri::command]
@@ -164,6 +194,7 @@ pub fn pause_active_meeting(state: State<'_, AppState>) -> Result<MeetingRecord,
     }
 
     stop_platform_capture_runtime(&state)?;
+    publish_audio_uplink_state(&state, AudioUplinkState::Paused)?;
     mutate_active_meeting(&state, &[SessionEvent::PauseRequested])
 }
 
@@ -181,6 +212,7 @@ pub fn resume_active_meeting(state: State<'_, AppState>) -> Result<MeetingRecord
     }
 
     start_platform_audio_capture(&state)?;
+    publish_audio_uplink_state(&state, AudioUplinkState::WaitingForAudio)?;
     mutate_active_meeting(&state, &[SessionEvent::ResumeRequested])
 }
 
@@ -231,6 +263,8 @@ fn prepare_runtime_for_meeting(
         state.audio_root_dir.clone(),
         transport.audio_transport().clone(),
         build_audio_coordinator_config(&state.runtime_config, meeting_id),
+        state.events.clone(),
+        transport.audio_target_addr().to_string(),
     );
     audio_runtime.prepare()?;
 
@@ -378,7 +412,9 @@ fn build_macos_audio_coordinator_config(
     meeting_id: &str,
 ) -> AudioCoordinatorConfig {
     match runtime_config.macos_system_audio_mode {
-        MacosSystemAudioMode::MirrorMicrophone => AudioCoordinatorConfig::new(meeting_id.to_string()),
+        MacosSystemAudioMode::MirrorMicrophone => {
+            AudioCoordinatorConfig::new(meeting_id.to_string())
+        }
         MacosSystemAudioMode::Disabled => AudioCoordinatorConfig::single_source_passthrough(
             meeting_id.to_string(),
             CaptureSourceKind::Microphone,
@@ -424,6 +460,20 @@ fn cleanup_failed_session_start(state: &State<'_, AppState>) -> Result<(), Strin
     if let Some(session_runtime) = session_runtime.as_ref() {
         let _ = session_runtime.control_transport().stop_recording();
         let _ = session_runtime.control_transport().disconnect();
+    }
+    Ok(())
+}
+
+fn publish_audio_uplink_state(
+    state: &State<'_, AppState>,
+    uplink_state: AudioUplinkState,
+) -> Result<(), String> {
+    let audio_runtime = state
+        .audio_runtime
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(runtime) = audio_runtime.as_ref() {
+        runtime.publish_uplink_state(uplink_state)?;
     }
     Ok(())
 }

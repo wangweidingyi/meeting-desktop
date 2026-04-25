@@ -223,7 +223,7 @@ pub struct MqttControlTransport {
     config: MqttControlConfig,
     event_bus: EventBus,
     broker_client: Option<Arc<dyn MqttBrokerClient>>,
-    state: Mutex<TransportState>,
+    state: Arc<Mutex<TransportState>>,
 }
 
 #[derive(Debug, Default)]
@@ -231,6 +231,9 @@ struct TransportState {
     connected: bool,
     outbound_messages: Vec<String>,
     last_error: Option<String>,
+    session_title: Option<String>,
+    should_record: bool,
+    needs_session_repair: bool,
 }
 
 impl MqttControlTransport {
@@ -239,7 +242,7 @@ impl MqttControlTransport {
             config,
             event_bus,
             broker_client: None,
-            state: Mutex::new(TransportState::default()),
+            state: Arc::new(Mutex::new(TransportState::default())),
         }
     }
 
@@ -252,7 +255,7 @@ impl MqttControlTransport {
             config,
             event_bus,
             broker_client: Some(broker_client),
-            state: Mutex::new(TransportState::default()),
+            state: Arc::new(Mutex::new(TransportState::default())),
         }
     }
 
@@ -390,9 +393,18 @@ impl MqttControlTransport {
 
     fn broker_message_handler(&self) -> MessageHandler {
         let event_bus = self.event_bus.clone();
+        let broker_client = self.broker_client.clone();
+        let config = self.config.clone();
+        let state = self.state.clone();
         Arc::new(move |message| match String::from_utf8(message.payload) {
             Ok(payload) => {
                 let _ = MqttControlTransport::dispatch_message(&event_bus, &payload);
+                if is_session_not_found_error(&payload) {
+                    if let Some(broker_client) = &broker_client {
+                        mark_session_repair_needed(&state);
+                        let _ = repair_active_session(&config, broker_client, &state, false);
+                    }
+                }
             }
             Err(_) => {
                 let _ = event_bus.publish(RuntimeEvent::TransportError {
@@ -405,8 +417,30 @@ impl MqttControlTransport {
     fn broker_lifecycle_handler(&self) -> LifecycleHandler {
         let event_bus = self.event_bus.clone();
         let session_id = self.config.session_id.clone();
+        let broker_client = self.broker_client.clone();
+        let config = self.config.clone();
+        let state = self.state.clone();
 
         Arc::new(move |event| {
+            match &event {
+                BrokerLifecycleEvent::Reconnecting { .. }
+                | BrokerLifecycleEvent::Disconnected { .. } => {
+                    mark_session_repair_needed(&state);
+                }
+                BrokerLifecycleEvent::Connected => {
+                    if let Some(broker_client) = &broker_client {
+                        if let Err(error) =
+                            repair_active_session(&config, broker_client, &state, true)
+                        {
+                            let _ = event_bus.publish(RuntimeEvent::TransportError {
+                                message: error,
+                            });
+                        }
+                    }
+                }
+                BrokerLifecycleEvent::Connecting => {}
+            }
+
             let runtime_event = match event {
                 BrokerLifecycleEvent::Connecting => {
                     RuntimeEvent::TransportStateChanged(TransportStatePayload {
@@ -446,19 +480,37 @@ impl MqttControlTransport {
     }
 
     pub fn start_recording(&self) -> Result<String, String> {
-        self.send_empty_control_envelope(MessageType::RecordingStart, "recording-start", 2)
+        let serialized =
+            self.send_empty_control_envelope(MessageType::RecordingStart, "recording-start", 2)?;
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.should_record = true;
+        Ok(serialized)
     }
 
     pub fn pause_recording(&self) -> Result<String, String> {
-        self.send_empty_control_envelope(MessageType::RecordingPause, "recording-pause", 3)
+        let serialized =
+            self.send_empty_control_envelope(MessageType::RecordingPause, "recording-pause", 3)?;
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.should_record = false;
+        Ok(serialized)
     }
 
     pub fn resume_recording(&self) -> Result<String, String> {
-        self.send_empty_control_envelope(MessageType::RecordingResume, "recording-resume", 4)
+        let serialized =
+            self.send_empty_control_envelope(MessageType::RecordingResume, "recording-resume", 4)?;
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.should_record = true;
+        Ok(serialized)
     }
 
     pub fn stop_recording(&self) -> Result<String, String> {
-        self.send_empty_control_envelope(MessageType::RecordingStop, "recording-stop", 5)
+        let serialized =
+            self.send_empty_control_envelope(MessageType::RecordingStop, "recording-stop", 5)?;
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.should_record = false;
+        state.session_title = None;
+        state.needs_session_repair = false;
+        Ok(serialized)
     }
 
     fn send_empty_control_envelope(
@@ -509,6 +561,10 @@ impl ControlTransport for MqttControlTransport {
             }
         }
 
+        if self.broker_client.is_none() {
+            return Err("mqtt broker is not configured".to_string());
+        }
+
         if let Some(broker_client) = &self.broker_client {
             broker_client.connect(
                 self.broker_message_handler(),
@@ -521,10 +577,6 @@ impl ControlTransport for MqttControlTransport {
 
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.connected = true;
-        if self.broker_client.is_none() {
-            drop(state);
-            self.publish_transport_state(TransportConnectionState::Connected, None)?;
-        }
         Ok(())
     }
 
@@ -577,6 +629,8 @@ impl ControlTransport for MqttControlTransport {
 
         let serialized = serde_json::to_string(&message).map_err(|error| error.to_string())?;
         self.send_control_message(&serialized)?;
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.session_title = Some(title.to_string());
         Ok(serialized)
     }
 
@@ -598,6 +652,10 @@ impl ControlTransport for MqttControlTransport {
         .to_string();
 
         self.send_control_message(&message)?;
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.session_title = None;
+        state.should_record = false;
+        state.needs_session_repair = false;
         Ok(message)
     }
 
@@ -638,6 +696,151 @@ impl ControlTransport for MqttControlTransport {
             message: message.to_string(),
         })
     }
+}
+
+fn mark_session_repair_needed(state: &Arc<Mutex<TransportState>>) {
+    if let Ok(mut state) = state.lock() {
+        if state.session_title.is_some() {
+            state.needs_session_repair = true;
+        }
+    }
+}
+
+fn repair_active_session(
+    config: &MqttControlConfig,
+    broker_client: &Arc<dyn MqttBrokerClient>,
+    state: &Arc<Mutex<TransportState>>,
+    resubscribe: bool,
+) -> Result<(), String> {
+    let plan = {
+        let mut state = state.lock().map_err(|error| error.to_string())?;
+        if !state.needs_session_repair {
+            return Ok(());
+        }
+
+        let Some(title) = state.session_title.clone() else {
+            state.needs_session_repair = false;
+            return Ok(());
+        };
+
+        let should_record = state.should_record;
+        state.needs_session_repair = false;
+        (title, should_record)
+    };
+
+    if resubscribe {
+        for (topic, qos) in MqttControlTransport::subscription_specs(config) {
+            broker_client.subscribe(&topic, qos)?;
+        }
+    }
+
+    let hello = serialize_open_session_envelope(config, &plan.0)?;
+    publish_control_message(config, broker_client, state, &hello)?;
+    if plan.1 {
+        let start = serialize_empty_control_envelope(
+            config,
+            MessageType::RecordingStart,
+            "recording-start",
+            2,
+        )?;
+        publish_control_message(config, broker_client, state, &start)?;
+    }
+
+    Ok(())
+}
+
+fn serialize_open_session_envelope(
+    config: &MqttControlConfig,
+    title: &str,
+) -> Result<String, String> {
+    let payload = SessionHelloPayload {
+        audio: AudioFormat {
+            encoding: "pcm_s16le".to_string(),
+            sample_rate: 16_000,
+            channels: 1,
+        },
+        transport: TransportSelection {
+            control: "mqtt".to_string(),
+            audio: "udp".to_string(),
+        },
+        features: FeatureFlags {
+            realtime_transcript: true,
+            realtime_summary: true,
+            action_items: true,
+        },
+        title: title.to_string(),
+    };
+
+    let message = MessageEnvelope {
+        version: "v1".to_string(),
+        message_id: format!("{}-hello-{}", config.session_id, config.client_id),
+        correlation_id: None,
+        client_id: config.client_id.clone(),
+        session_id: config.session_id.clone(),
+        seq: 1,
+        sent_at: "1970-01-01T00:00:00Z".to_string(),
+        message_type: MessageType::SessionHello,
+        payload,
+    };
+
+    serde_json::to_string(&message).map_err(|error| error.to_string())
+}
+
+fn serialize_empty_control_envelope(
+    config: &MqttControlConfig,
+    message_type: MessageType,
+    message_suffix: &str,
+    seq: u64,
+) -> Result<String, String> {
+    let message = MessageEnvelope {
+        version: "v1".to_string(),
+        message_id: format!("{}-{message_suffix}", config.session_id),
+        correlation_id: None,
+        client_id: config.client_id.clone(),
+        session_id: config.session_id.clone(),
+        seq,
+        sent_at: "1970-01-01T00:00:00Z".to_string(),
+        message_type,
+        payload: serde_json::json!({}),
+    };
+
+    serde_json::to_string(&message).map_err(|error| error.to_string())
+}
+
+fn publish_control_message(
+    config: &MqttControlConfig,
+    broker_client: &Arc<dyn MqttBrokerClient>,
+    state: &Arc<Mutex<TransportState>>,
+    payload: &str,
+) -> Result<(), String> {
+    {
+        let mut state = state.lock().map_err(|error| error.to_string())?;
+        if !state.connected {
+            return Err("transport is not connected".to_string());
+        }
+        state.outbound_messages.push(payload.to_string());
+    }
+
+    broker_client.publish(
+        &control_topic(&config.client_id, &config.session_id),
+        BrokerQos::AtLeastOnce,
+        false,
+        payload.as_bytes().to_vec(),
+    )
+}
+
+fn is_session_not_found_error(raw_payload: &str) -> bool {
+    let Ok(envelope) = serde_json::from_str::<IncomingEnvelope>(raw_payload) else {
+        return false;
+    };
+    if envelope.message_type != "error" {
+        return false;
+    }
+
+    let Ok(payload) = deserialize_payload::<IncomingErrorPayload>(envelope.payload) else {
+        return false;
+    };
+    payload.message.trim() == "session not found"
 }
 
 fn parse_broker_url(url: &str) -> Result<(String, u16), String> {
@@ -888,6 +1091,33 @@ mod tests {
 
     #[test]
     fn open_session_serializes_hello_envelope_and_queues_it() {
+        let broker = FakeBrokerClient::default();
+        let transport = MqttControlTransport::with_broker_client(
+            MqttControlConfig {
+                client_id: "client-a".to_string(),
+                session_id: "session-1".to_string(),
+            },
+            EventBus::default(),
+            Arc::new(broker.clone()),
+        );
+
+        transport.connect().unwrap();
+        let hello = transport.open_session("架构评审会").unwrap();
+
+        let snapshot = broker.snapshot();
+
+        assert!(hello.contains("\"type\":\"session/hello\""));
+        assert!(hello.contains("\"title\":\"架构评审会\""));
+        assert_eq!(transport.queued_messages().unwrap(), vec![hello.clone()]);
+        assert_eq!(snapshot.publishes.len(), 1);
+        assert_eq!(
+            snapshot.publishes[0].0,
+            "meetings/client-a/session/session-1/control".to_string()
+        );
+    }
+
+    #[test]
+    fn connect_without_broker_client_returns_configuration_error() {
         let transport = MqttControlTransport::new(
             MqttControlConfig {
                 client_id: "client-a".to_string(),
@@ -896,25 +1126,17 @@ mod tests {
             EventBus::default(),
         );
 
-        transport.connect().unwrap();
-        let hello = transport.open_session("架构评审会").unwrap();
-
+        let error = transport.connect().unwrap_err();
         let events = transport.event_bus.snapshot().unwrap();
 
-        assert!(hello.contains("\"type\":\"session/hello\""));
-        assert!(hello.contains("\"title\":\"架构评审会\""));
-        assert_eq!(transport.queued_messages().unwrap(), vec![hello]);
+        assert_eq!(error, "mqtt broker is not configured");
+        assert!(transport.queued_messages().unwrap().is_empty());
         assert_eq!(
             events,
             vec![
                 RuntimeEvent::TransportStateChanged(TransportStatePayload {
                     session_id: "session-1".to_string(),
                     state: TransportConnectionState::Connecting,
-                    message: None,
-                }),
-                RuntimeEvent::TransportStateChanged(TransportStatePayload {
-                    session_id: "session-1".to_string(),
-                    state: TransportConnectionState::Connected,
                     message: None,
                 }),
             ]
@@ -1223,5 +1445,80 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn broker_reconnect_resubscribes_and_repairs_active_recording_session() {
+        let event_bus = EventBus::default();
+        let broker = FakeBrokerClient::default();
+        let transport = MqttControlTransport::with_broker_client(
+            MqttControlConfig {
+                client_id: "client-a".to_string(),
+                session_id: "session-42".to_string(),
+            },
+            event_bus,
+            Arc::new(broker.clone()),
+        );
+
+        transport.connect().unwrap();
+        broker.push_lifecycle(BrokerLifecycleEvent::Connected);
+        transport.open_session("客户复盘会").unwrap();
+        transport.start_recording().unwrap();
+
+        broker.push_lifecycle(BrokerLifecycleEvent::Reconnecting {
+            message: "connection reset".to_string(),
+        });
+        broker.push_lifecycle(BrokerLifecycleEvent::Connected);
+
+        let snapshot = broker.snapshot();
+
+        assert_eq!(snapshot.subscriptions.len(), 10);
+        assert_eq!(snapshot.publishes.len(), 4);
+        assert!(String::from_utf8(snapshot.publishes[2].3.clone())
+            .unwrap()
+            .contains("\"type\":\"session/hello\""));
+        assert!(String::from_utf8(snapshot.publishes[3].3.clone())
+            .unwrap()
+            .contains("\"type\":\"recording/start\""));
+    }
+
+    #[test]
+    fn session_not_found_error_triggers_active_session_repair() {
+        let event_bus = EventBus::default();
+        let broker = FakeBrokerClient::default();
+        let transport = MqttControlTransport::with_broker_client(
+            MqttControlConfig {
+                client_id: "client-a".to_string(),
+                session_id: "session-77".to_string(),
+            },
+            event_bus,
+            Arc::new(broker.clone()),
+        );
+
+        transport.connect().unwrap();
+        broker.push_lifecycle(BrokerLifecycleEvent::Connected);
+        transport.open_session("客户复盘会").unwrap();
+        transport.start_recording().unwrap();
+
+        broker.push_incoming(
+            "meetings/client-a/session/session-77/control/reply",
+            r#"{
+                "type": "error",
+                "sessionId": "session-77",
+                "payload": {
+                    "message": "session not found"
+                }
+            }"#,
+        );
+
+        let snapshot = broker.snapshot();
+
+        assert_eq!(snapshot.publishes.len(), 4);
+        assert!(String::from_utf8(snapshot.publishes[2].3.clone())
+            .unwrap()
+            .contains("\"type\":\"session/hello\""));
+        assert!(String::from_utf8(snapshot.publishes[3].3.clone())
+            .unwrap()
+            .contains("\"type\":\"recording/start\""));
     }
 }

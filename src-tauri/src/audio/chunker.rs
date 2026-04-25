@@ -29,6 +29,8 @@ impl AudioChunkerConfig {
 pub struct AudioChunker {
     config: AudioChunkerConfig,
     next_sequence: u64,
+    buffered_started_at_ms: Option<u64>,
+    buffered_samples: Vec<i16>,
 }
 
 impl AudioChunker {
@@ -36,6 +38,8 @@ impl AudioChunker {
         Self {
             config,
             next_sequence: 0,
+            buffered_started_at_ms: None,
+            buffered_samples: Vec::new(),
         }
     }
 
@@ -43,6 +47,8 @@ impl AudioChunker {
         Self {
             config,
             next_sequence,
+            buffered_started_at_ms: None,
+            buffered_samples: Vec::new(),
         }
     }
 
@@ -52,24 +58,41 @@ impl AudioChunker {
             return Vec::new();
         }
 
-        samples
-            .chunks(samples_per_chunk)
-            .scan(started_at_ms, |chunk_started_at_ms, pcm_samples| {
-                let duration_ms = duration_ms_for_samples(
-                    pcm_samples.len(),
-                    self.config.sample_rate_hz,
-                    self.config.channels,
-                );
-                let chunk = AudioChunk {
-                    sequence: self.take_sequence(),
-                    started_at_ms: *chunk_started_at_ms,
-                    duration_ms,
-                    payload: encode_pcm16le(pcm_samples),
-                };
-                *chunk_started_at_ms += u64::from(duration_ms);
-                Some(chunk)
-            })
-            .collect()
+        if self.buffered_started_at_ms.is_none() {
+            self.buffered_started_at_ms = Some(started_at_ms);
+        }
+        self.buffered_samples.extend_from_slice(samples);
+
+        let mut chunks = Vec::new();
+        while self.buffered_samples.len() >= samples_per_chunk {
+            let chunk_started_at_ms = self
+                .buffered_started_at_ms
+                .ok_or("missing chunk start timestamp")
+                .unwrap_or(started_at_ms);
+            let pcm_samples = self.buffered_samples[..samples_per_chunk].to_vec();
+            self.buffered_samples.drain(..samples_per_chunk);
+
+            let duration_ms = duration_ms_for_samples(
+                pcm_samples.len(),
+                self.config.sample_rate_hz,
+                self.config.channels,
+            );
+            chunks.push(AudioChunk {
+                sequence: self.take_sequence(),
+                started_at_ms: chunk_started_at_ms,
+                duration_ms,
+                payload: encode_pcm16le(&pcm_samples),
+            });
+
+            self.buffered_started_at_ms =
+                Some(chunk_started_at_ms.saturating_add(u64::from(duration_ms)));
+        }
+
+        if self.buffered_samples.is_empty() {
+            self.buffered_started_at_ms = None;
+        }
+
+        chunks
     }
 
     fn take_sequence(&mut self) -> u64 {

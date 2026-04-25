@@ -29,7 +29,8 @@ pub fn start_capture_worker(
     let worker = thread::Builder::new()
         .name(format!("meeting-capture-{}", worker_descriptor.device.id))
         .spawn(move || {
-            if let Err(error) = run_capture_loop(worker_descriptor, worker_sink, worker_active, config)
+            if let Err(error) =
+                run_capture_loop(worker_descriptor, worker_sink, worker_active, config)
             {
                 eprintln!("capture worker exited with error: {error}");
             }
@@ -89,7 +90,9 @@ fn run_capture_loop(
         descriptor: &CaptureStreamDescriptor,
         role: DeviceRole,
     ) -> Result<wasapi::Device, String> {
-        let count = collection.get_nbr_devices().map_err(|error| error.to_string())?;
+        let count = collection
+            .get_nbr_devices()
+            .map_err(|error| error.to_string())?;
         for index in 0..count {
             let device = collection
                 .get_device_at_index(index)
@@ -118,7 +121,9 @@ fn run_capture_loop(
         .get_device_collection(&direction)
         .map_err(|error| error.to_string())?;
     let device = resolve_device(&enumerator, &collection, &descriptor, config.role)?;
-    let audio_client = device.get_iaudioclient().map_err(|error| error.to_string())?;
+    let audio_client = device
+        .get_iaudioclient()
+        .map_err(|error| error.to_string())?;
     let bytes_per_sample = match config.sample_format {
         CapturedSampleFormat::I16 => 2,
         CapturedSampleFormat::F32 => 4,

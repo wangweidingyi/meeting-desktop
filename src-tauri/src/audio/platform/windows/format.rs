@@ -40,7 +40,9 @@ fn decode_f32_le(bytes: &[u8]) -> Result<Vec<i16>, String> {
             } else {
                 clamped * f32::from(i16::MAX) + clamped.signum()
             };
-            scaled.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+            scaled
+                .round()
+                .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
         })
         .collect())
 }

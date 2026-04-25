@@ -3,6 +3,7 @@ import type { DesktopMeetingRecord } from "@/features/session/models";
 import type { MeetingDetailView, MeetingListItem } from "@/features/meetings/models";
 import type { SummaryViewState } from "@/features/summary/models";
 import type { TranscriptSegmentView } from "@/features/transcript/models";
+import { getDesktopAuthSession } from "@/lib/auth";
 
 type RawTranscriptSegment = {
   segment_id: string;
@@ -30,6 +31,22 @@ type RawMeetingDetail = {
   transcript_segments: RawTranscriptSegment[];
   summary: RawSummarySnapshot;
   action_items: string[];
+};
+
+export type RuntimeBackendInfo = {
+  controlClientId: string;
+  currentUserId: string | null;
+  currentUserName: string | null;
+  mqttBrokerUrl: string | null;
+  audioTargetAddr: string;
+  adminApiBaseUrl: string | null;
+  startupSttProvider: string | null;
+  startupSttModel: string | null;
+  startupSttResourceId: string | null;
+};
+
+type SyncedMeetingRecord = DesktopMeetingRecord & {
+  client_id: string;
 };
 
 function formatDuration(durationMs: number) {
@@ -81,6 +98,38 @@ function mapSummary(summary: RawSummarySnapshot): SummaryViewState {
 
 export async function createMeeting(title: string) {
   return invoke<DesktopMeetingRecord>("create_meeting", { title });
+}
+
+export async function getRuntimeBackendInfo() {
+  return invoke<RuntimeBackendInfo>("get_runtime_backend_info");
+}
+
+export async function syncMeetingToBackend(meeting: DesktopMeetingRecord) {
+  const runtime = await getRuntimeBackendInfo();
+  if (!runtime.adminApiBaseUrl) {
+    return;
+  }
+  const session = getDesktopAuthSession();
+  if (!session?.token) {
+    return;
+  }
+
+  const response = await fetch(`${runtime.adminApiBaseUrl}/api/app/meetings/${meeting.id}`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${session.token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      ...meeting,
+      client_id: runtime.controlClientId,
+    } satisfies SyncedMeetingRecord),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(body || `backend meeting sync failed with status ${response.status}`);
+  }
 }
 
 export async function listRecoverableMeetings() {

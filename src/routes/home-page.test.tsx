@@ -10,6 +10,7 @@ const commandMocks = vi.hoisted(() => ({
   listMeetingHistoryMock: vi.fn(),
   resumeRecoverableMeetingMock: vi.fn(),
   getMeetingDetailMock: vi.fn(),
+  syncMeetingToBackendMock: vi.fn(),
 }));
 
 vi.mock("@/lib/api/commands", () => ({
@@ -17,6 +18,7 @@ vi.mock("@/lib/api/commands", () => ({
   listMeetingHistory: commandMocks.listMeetingHistoryMock,
   resumeRecoverableMeeting: commandMocks.resumeRecoverableMeetingMock,
   getMeetingDetail: commandMocks.getMeetingDetailMock,
+  syncMeetingToBackend: commandMocks.syncMeetingToBackendMock,
 }));
 
 describe("HomePage", () => {
@@ -26,6 +28,8 @@ describe("HomePage", () => {
     commandMocks.listMeetingHistoryMock.mockReset();
     commandMocks.resumeRecoverableMeetingMock.mockReset();
     commandMocks.getMeetingDetailMock.mockReset();
+    commandMocks.syncMeetingToBackendMock.mockReset();
+    commandMocks.syncMeetingToBackendMock.mockResolvedValue(undefined);
   });
 
   it("shows recoverable meeting prompt and resumes the unfinished meeting", async () => {
@@ -108,6 +112,12 @@ describe("HomePage", () => {
     await waitFor(() => {
       expect(commandMocks.resumeRecoverableMeetingMock).toHaveBeenCalledWith("meeting-1");
       expect(commandMocks.getMeetingDetailMock).toHaveBeenCalledWith("meeting-1");
+      expect(commandMocks.syncMeetingToBackendMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "meeting-1",
+          status: "recording",
+        }),
+      );
       expect(useSessionViewStore.getState().transcript[0].text).toBe("恢复后的转写内容");
       expect(useSessionViewStore.getState().summary.abstract).toBe("恢复后的纪要摘要");
     });

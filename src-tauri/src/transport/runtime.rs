@@ -190,11 +190,18 @@ mod tests {
         let target = listener.local_addr().unwrap();
         let config = BackendRuntimeConfig {
             client_id: "desktop-dev".to_string(),
+            current_user_id: Some("user-9".to_string()),
+            current_user_name: Some("Runtime Tester".to_string()),
             mqtt_broker: Some("tcp://127.0.0.1:1883".to_string()),
             mqtt_username: Some("meeting-user".to_string()),
             mqtt_password: Some("meeting-pass".to_string()),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 8090,
             udp_host: "127.0.0.1".to_string(),
             udp_port: target.port(),
+            startup_stt_provider: Some("volcengine_streaming".to_string()),
+            startup_stt_model: Some("bigmodel".to_string()),
+            startup_stt_resource_id: Some("volc.seedasr.sauc.duration".to_string()),
             macos_system_audio_mode: MacosSystemAudioMode::Disabled,
         };
 

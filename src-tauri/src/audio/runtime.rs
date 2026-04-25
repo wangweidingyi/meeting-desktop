@@ -11,6 +11,8 @@ use crate::audio::mixer::mix_aligned_sources_to_mono;
 use crate::audio::reader::{pcm16_wave_duration_ms, read_pcm16_wave_window};
 use crate::audio::timeline::{align_stream_start_ms, duration_ms_for_samples};
 use crate::audio::writer::{append_pcm16_wave, AudioAssetPaths};
+use crate::events::bus::EventBus;
+use crate::events::types::{AudioUplinkState, RuntimeDiagnosticsPayload, RuntimeEvent};
 use crate::session::recovery::{plan_recovery, RecoveryPlan};
 use crate::storage::audio_repo::{AudioAssetRecord, AudioRepo};
 use crate::storage::checkpoint_repo::{CheckpointRepo, SessionCheckpointRecord};
@@ -35,6 +37,8 @@ where
     sample_rate_hz: u32,
     channels: u16,
     uplink_strategy: AudioUplinkStrategy,
+    event_bus: EventBus,
+    audio_target_addr: String,
 }
 
 impl<T> MeetingAudioRuntime<T>
@@ -46,6 +50,8 @@ where
         root_dir: PathBuf,
         transport: T,
         config: AudioCoordinatorConfig,
+        event_bus: EventBus,
+        audio_target_addr: String,
     ) -> Self {
         let meeting_id = config.meeting_id.clone();
         let sample_rate_hz = config.sample_rate_hz;
@@ -67,6 +73,8 @@ where
             sample_rate_hz,
             channels,
             uplink_strategy,
+            event_bus,
+            audio_target_addr,
         }
     }
 
@@ -100,33 +108,42 @@ where
         };
         self.asset_paths = Some(assets);
 
-        self.database
+        let checkpoint = self
+            .database
             .with_connection(|connection| {
                 AudioRepo::upsert(connection, &audio_assets)?;
-                let checkpoint = match CheckpointRepo::find_by_meeting_id(connection, &self.meeting_id)?
-                {
-                    Some(existing) => SessionCheckpointRecord {
-                        local_recording_state: "prepared".to_string(),
-                        updated_at: current_timestamp_label(),
-                        ..existing
-                    },
-                    None => SessionCheckpointRecord {
-                        meeting_id: self.meeting_id.clone(),
-                        last_control_seq: 0,
-                        last_udp_seq_sent: 0,
-                        last_uploaded_mixed_ms: 0,
-                        last_transcript_segment_revision: 0,
-                        last_summary_version: 0,
-                        last_action_item_version: 0,
-                        local_recording_state: "prepared".to_string(),
-                        recovery_token: None,
-                        updated_at: current_timestamp_label(),
-                    },
-                };
+                let checkpoint =
+                    match CheckpointRepo::find_by_meeting_id(connection, &self.meeting_id)? {
+                        Some(existing) => SessionCheckpointRecord {
+                            local_recording_state: "prepared".to_string(),
+                            updated_at: current_timestamp_label(),
+                            ..existing
+                        },
+                        None => SessionCheckpointRecord {
+                            meeting_id: self.meeting_id.clone(),
+                            last_control_seq: 0,
+                            last_udp_seq_sent: 0,
+                            last_uploaded_mixed_ms: 0,
+                            last_transcript_segment_revision: 0,
+                            last_summary_version: 0,
+                            last_action_item_version: 0,
+                            local_recording_state: "prepared".to_string(),
+                            recovery_token: None,
+                            updated_at: current_timestamp_label(),
+                        },
+                    };
 
-                CheckpointRepo::upsert(connection, &checkpoint)
+                CheckpointRepo::upsert(connection, &checkpoint)?;
+                Ok(checkpoint)
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+
+        self.publish_runtime_diagnostics(
+            AudioUplinkState::Idle,
+            checkpoint.last_uploaded_mixed_ms,
+            sequence_for_diagnostics(&checkpoint),
+            None,
+        )
     }
 
     pub fn start_capture(&mut self) -> Result<(), String> {
@@ -140,7 +157,17 @@ where
             self.next_chunk_sequence()?,
         ));
         self.uplink_strategy = plan.uplink_strategy;
-        self.persist_recording_state("recording")
+        self.persist_recording_state("recording")?;
+
+        let checkpoint = self
+            .load_checkpoint()?
+            .unwrap_or_else(|| default_checkpoint(&self.meeting_id));
+        self.publish_runtime_diagnostics(
+            AudioUplinkState::WaitingForAudio,
+            checkpoint.last_uploaded_mixed_ms,
+            sequence_for_diagnostics(&checkpoint),
+            None,
+        )
     }
 
     pub fn replay_pending_mixed_audio(&mut self) -> Result<Option<RecoveryPlan>, String> {
@@ -159,6 +186,12 @@ where
         let Some(plan) = plan_recovery(&checkpoint, local_mixed_duration_ms) else {
             return Ok(None);
         };
+        self.publish_runtime_diagnostics(
+            AudioUplinkState::Replaying,
+            checkpoint.last_uploaded_mixed_ms,
+            sequence_for_diagnostics(&checkpoint),
+            Some((plan.replay_from_ms, plan.replay_until_ms)),
+        )?;
         let samples = read_pcm16_wave_window(
             &assets.mixed_uplink_path,
             self.sample_rate_hz,
@@ -168,8 +201,23 @@ where
         )?;
 
         if !samples.is_empty() {
-            self.ingest_mixed_samples(plan.replay_from_ms, &samples)?;
+            self.ingest_mixed_samples_with_state(
+                plan.replay_from_ms,
+                &samples,
+                AudioUplinkState::Replaying,
+                Some((plan.replay_from_ms, plan.replay_until_ms)),
+            )?;
         }
+
+        let refreshed_checkpoint = self
+            .load_checkpoint()?
+            .unwrap_or_else(|| default_checkpoint(&self.meeting_id));
+        self.publish_runtime_diagnostics(
+            AudioUplinkState::WaitingForAudio,
+            refreshed_checkpoint.last_uploaded_mixed_ms,
+            sequence_for_diagnostics(&refreshed_checkpoint),
+            None,
+        )?;
 
         Ok(Some(plan))
     }
@@ -201,7 +249,8 @@ where
             ),
         }
 
-        if let AudioUplinkStrategy::PassthroughSingleSource(primary_source) = &self.uplink_strategy {
+        if let AudioUplinkStrategy::PassthroughSingleSource(primary_source) = &self.uplink_strategy
+        {
             if *primary_source == source {
                 return self.ingest_passthrough_samples(started_at_ms, samples);
             }
@@ -215,6 +264,33 @@ where
         started_at_ms: u64,
         samples: &[i16],
     ) -> Result<Vec<AudioUploadProgress>, String> {
+        self.ingest_mixed_samples_with_state(
+            started_at_ms,
+            samples,
+            AudioUplinkState::Streaming,
+            None,
+        )
+    }
+
+    pub fn publish_uplink_state(&self, state: AudioUplinkState) -> Result<(), String> {
+        let checkpoint = self
+            .load_checkpoint()?
+            .unwrap_or_else(|| default_checkpoint(&self.meeting_id));
+        self.publish_runtime_diagnostics(
+            state,
+            checkpoint.last_uploaded_mixed_ms,
+            sequence_for_diagnostics(&checkpoint),
+            None,
+        )
+    }
+
+    fn ingest_mixed_samples_with_state(
+        &mut self,
+        started_at_ms: u64,
+        samples: &[i16],
+        uplink_state: AudioUplinkState,
+        replay_window: Option<(u64, u64)>,
+    ) -> Result<Vec<AudioUploadProgress>, String> {
         let chunker = self
             .chunker
             .as_mut()
@@ -223,16 +299,24 @@ where
         let mut progresses = Vec::new();
         for chunk in chunker.chunk_samples(started_at_ms, samples) {
             let progress = self.transport.send_audio_chunk(&chunk)?;
+            let sent_at = current_timestamp_label();
             self.database
                 .with_connection(|connection| {
                     CheckpointRepo::record_audio_upload(
                         connection,
                         &self.meeting_id,
                         &progress,
-                        &current_timestamp_label(),
+                        &sent_at,
                     )
                 })
                 .map_err(|error| error.to_string())?;
+            self.publish_runtime_diagnostics_with_timestamp(
+                uplink_state.clone(),
+                progress.last_uploaded_mixed_ms,
+                Some(progress.sequence),
+                Some(sent_at),
+                replay_window,
+            )?;
             progresses.push(progress);
         }
 
@@ -240,7 +324,8 @@ where
     }
 
     pub fn stop(&self) -> Result<(), String> {
-        self.persist_recording_state("stopped")
+        self.persist_recording_state("stopped")?;
+        self.publish_uplink_state(AudioUplinkState::Stopped)
     }
 
     fn append_source_wave(
@@ -353,6 +438,49 @@ where
             .map_err(|error| error.to_string())
     }
 
+    fn publish_runtime_diagnostics(
+        &self,
+        audio_uplink_state: AudioUplinkState,
+        last_uploaded_mixed_ms: u64,
+        last_chunk_sequence: Option<u64>,
+        replay_window: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        self.publish_runtime_diagnostics_with_timestamp(
+            audio_uplink_state,
+            last_uploaded_mixed_ms,
+            last_chunk_sequence,
+            None,
+            replay_window,
+        )
+    }
+
+    fn publish_runtime_diagnostics_with_timestamp(
+        &self,
+        audio_uplink_state: AudioUplinkState,
+        last_uploaded_mixed_ms: u64,
+        last_chunk_sequence: Option<u64>,
+        last_chunk_sent_at: Option<String>,
+        replay_window: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        let (replay_from_ms, replay_until_ms) = replay_window
+            .map(|(from, until)| (Some(from), Some(until)))
+            .unwrap_or((None, None));
+
+        self.event_bus
+            .publish(RuntimeEvent::RuntimeDiagnosticsUpdated(
+                RuntimeDiagnosticsPayload {
+                    session_id: self.meeting_id.clone(),
+                    audio_target_addr: self.audio_target_addr.clone(),
+                    audio_uplink_state,
+                    last_uploaded_mixed_ms,
+                    last_chunk_sequence,
+                    last_chunk_sent_at,
+                    replay_from_ms,
+                    replay_until_ms,
+                },
+            ))
+    }
+
     fn next_chunk_sequence(&self) -> Result<u64, String> {
         Ok(self
             .load_checkpoint()?
@@ -364,6 +492,29 @@ where
                 }
             })
             .unwrap_or(0))
+    }
+}
+
+fn sequence_for_diagnostics(checkpoint: &SessionCheckpointRecord) -> Option<u64> {
+    if checkpoint.last_uploaded_mixed_ms == 0 {
+        None
+    } else {
+        Some(checkpoint.last_udp_seq_sent)
+    }
+}
+
+fn default_checkpoint(meeting_id: &str) -> SessionCheckpointRecord {
+    SessionCheckpointRecord {
+        meeting_id: meeting_id.to_string(),
+        last_control_seq: 0,
+        last_udp_seq_sent: 0,
+        last_uploaded_mixed_ms: 0,
+        last_transcript_segment_revision: 0,
+        last_summary_version: 0,
+        last_action_item_version: 0,
+        local_recording_state: "prepared".to_string(),
+        recovery_token: None,
+        updated_at: current_timestamp_label(),
     }
 }
 
@@ -498,8 +649,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::MeetingAudioRuntime;
-    use crate::audio::writer::append_pcm16_wave;
     use crate::audio::coordinator::{AudioCoordinatorConfig, CaptureSourceKind};
+    use crate::audio::writer::append_pcm16_wave;
+    use crate::events::bus::EventBus;
+    use crate::events::types::RuntimeEvent;
     use crate::protocol::udp_packet::UdpAudioPacket;
     use crate::storage::audio_repo::AudioRepo;
     use crate::storage::checkpoint_repo::{CheckpointRepo, SessionCheckpointRecord};
@@ -522,6 +675,8 @@ mod tests {
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
 
         runtime.prepare().unwrap();
@@ -581,6 +736,8 @@ mod tests {
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
 
         runtime.prepare().unwrap();
@@ -606,6 +763,8 @@ mod tests {
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
 
         runtime.prepare().unwrap();
@@ -627,6 +786,37 @@ mod tests {
     }
 
     #[test]
+    fn audio_runtime_publishes_runtime_diagnostics_on_upload() {
+        let database = Database::open_in_memory().unwrap();
+        let event_bus = EventBus::default();
+        let mut runtime = MeetingAudioRuntime::new(
+            database.clone(),
+            env::temp_dir(),
+            UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
+            AudioCoordinatorConfig::new("meeting-1"),
+            event_bus.clone(),
+            "127.0.0.1:6000".to_string(),
+        );
+
+        runtime.prepare().unwrap();
+        runtime.start_capture().unwrap();
+        runtime
+            .ingest_mixed_samples(1_000, &vec![320; 3_200])
+            .unwrap();
+
+        let events = event_bus.snapshot().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RuntimeDiagnosticsUpdated(payload)
+                if payload.session_id == "meeting-1"
+                    && payload.audio_target_addr == "127.0.0.1:6000"
+                    && payload.audio_uplink_state == crate::events::types::AudioUplinkState::Streaming
+                    && payload.last_uploaded_mixed_ms == 1_200
+                    && payload.last_chunk_sequence == Some(0)
+        )));
+    }
+
+    #[test]
     fn push_source_samples_writes_source_and_mixed_wav_then_updates_checkpoint() {
         let database = Database::open_in_memory().unwrap();
         let temp_dir = unique_temp_dir("source-ingress");
@@ -636,6 +826,8 @@ mod tests {
             temp_dir,
             UdpAudioTransport::new("meeting-1", socket.clone()),
             AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
 
         runtime.prepare().unwrap();
@@ -693,6 +885,8 @@ mod tests {
             temp_dir,
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
 
         runtime.prepare().unwrap();
@@ -701,8 +895,11 @@ mod tests {
         runtime
             .push_source_samples(CaptureSourceKind::Microphone, 1_000, &vec![1000; 3_200])
             .unwrap();
-        let progress = runtime
+        let initial_progress = runtime
             .push_source_samples(CaptureSourceKind::SystemLoopback, 1_100, &vec![2000; 3_200])
+            .unwrap();
+        let progress = runtime
+            .push_source_samples(CaptureSourceKind::Microphone, 1_200, &vec![1000; 1_600])
             .unwrap();
 
         let checkpoint = database
@@ -712,9 +909,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert!(initial_progress.is_empty());
         assert_eq!(progress.len(), 1);
-        assert_eq!(progress[0].last_uploaded_mixed_ms, 1_200);
-        assert_eq!(checkpoint.last_uploaded_mixed_ms, 1_200);
+        assert_eq!(progress[0].last_uploaded_mixed_ms, 1_300);
+        assert_eq!(checkpoint.last_uploaded_mixed_ms, 1_300);
     }
 
     #[test]
@@ -730,6 +928,8 @@ mod tests {
                 "meeting-1",
                 CaptureSourceKind::Microphone,
             ),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
 
         runtime.prepare().unwrap();
@@ -754,7 +954,9 @@ mod tests {
         assert_eq!(checkpoint.last_udp_seq_sent, 0);
         assert_eq!(checkpoint.last_uploaded_mixed_ms, 1_200);
         assert_eq!(
-            fs::metadata(assets.mic_original_path.unwrap()).unwrap().len(),
+            fs::metadata(assets.mic_original_path.unwrap())
+                .unwrap()
+                .len(),
             6_444
         );
         assert_eq!(
@@ -764,7 +966,9 @@ mod tests {
             44
         );
         assert_eq!(
-            fs::metadata(assets.mixed_uplink_path.unwrap()).unwrap().len(),
+            fs::metadata(assets.mixed_uplink_path.unwrap())
+                .unwrap()
+                .len(),
             6_444
         );
         assert!(socket.take_last_packet().is_some());
@@ -780,6 +984,8 @@ mod tests {
             temp_dir,
             UdpAudioTransport::new("meeting-1", socket.clone()),
             AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
 
         runtime.prepare().unwrap();
@@ -843,6 +1049,8 @@ mod tests {
             temp_dir,
             UdpAudioTransport::new("meeting-1", socket.clone()),
             AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
 
         runtime.prepare().unwrap();
@@ -880,7 +1088,9 @@ mod tests {
 
         runtime.start_capture().unwrap();
         runtime.replay_pending_mixed_audio().unwrap();
-        runtime.ingest_mixed_samples(400, &vec![640; 3_200]).unwrap();
+        runtime
+            .ingest_mixed_samples(400, &vec![640; 3_200])
+            .unwrap();
 
         let packets = socket.packets();
 

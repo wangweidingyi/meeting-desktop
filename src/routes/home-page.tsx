@@ -17,7 +17,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import type { DesktopMeetingRecord } from "@/features/session/models";
 import { useMeetingHistory } from "@/features/meetings/hooks/use-meeting-history";
-import { getMeetingDetail, listRecoverableMeetings, resumeRecoverableMeeting } from "@/lib/api/commands";
+import {
+  getMeetingDetail,
+  listRecoverableMeetings,
+  resumeRecoverableMeeting,
+  syncMeetingToBackend,
+} from "@/lib/api/commands";
 import { cn } from "@/lib/utils";
 import { useSessionViewStore } from "@/lib/state/session-view-store";
 
@@ -67,6 +72,7 @@ export function HomePage() {
     const store = useSessionViewStore.getState();
 
     store.syncFromMeetingRecord(meeting);
+    await syncMeetingToBackend(meeting);
 
     try {
       const detail = await getMeetingDetail(recoverableMeeting.id);

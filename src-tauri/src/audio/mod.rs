@@ -48,12 +48,11 @@ mod tests {
 
     #[test]
     fn audio_coordinator_can_start_in_single_source_passthrough_mode() {
-        let mut coordinator = AudioCoordinator::new(
-            AudioCoordinatorConfig::single_source_passthrough(
+        let mut coordinator =
+            AudioCoordinator::new(AudioCoordinatorConfig::single_source_passthrough(
                 "meeting-1",
                 CaptureSourceKind::Microphone,
-            ),
-        );
+            ));
 
         coordinator.register_source(CaptureSourceKind::Microphone);
 
@@ -94,5 +93,29 @@ mod tests {
         assert_eq!(chunks[1].sequence, 1);
         assert_eq!(chunks[1].started_at_ms, 1_200);
         assert_eq!(chunks[1].duration_ms, 200);
+    }
+
+    #[test]
+    fn chunker_buffers_small_frames_until_a_full_200ms_chunk_is_ready() {
+        let mut chunker = super::chunker::AudioChunker::new(
+            super::chunker::AudioChunkerConfig::pcm16_mono_16khz(),
+        );
+        let frame = vec![160; 160];
+
+        for index in 0..19 {
+            let chunks = chunker.chunk_samples(1_000 + index * 10, &frame);
+            assert!(
+                chunks.is_empty(),
+                "expected no chunk before 200ms is accumulated, got {chunks:?} at frame {index}"
+            );
+        }
+
+        let chunks = chunker.chunk_samples(1_190, &frame);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].sequence, 0);
+        assert_eq!(chunks[0].started_at_ms, 1_000);
+        assert_eq!(chunks[0].duration_ms, 200);
+        assert_eq!(chunks[0].payload.len(), 6_400);
     }
 }

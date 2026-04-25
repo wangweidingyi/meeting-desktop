@@ -11,6 +11,7 @@ pub const DESKTOP_EVENT_SUMMARY_DELTA: &str = "meeting://summary-delta";
 pub const DESKTOP_EVENT_ACTION_ITEMS_DELTA: &str = "meeting://action-items-delta";
 pub const DESKTOP_EVENT_TRANSPORT_STATE: &str = "meeting://transport-state";
 pub const DESKTOP_EVENT_TRANSPORT_ERROR: &str = "meeting://transport-error";
+pub const DESKTOP_EVENT_RUNTIME_DIAGNOSTICS: &str = "meeting://runtime-diagnostics";
 
 pub fn process_runtime_event(database: &Database, event: &RuntimeEvent) -> Result<(), String> {
     match event {
@@ -101,6 +102,9 @@ pub fn emit_runtime_event(app_handle: &AppHandle, event: &RuntimeEvent) -> Resul
             .map_err(|error| error.to_string()),
         RuntimeEvent::TransportStateChanged(payload) => app_handle
             .emit(DESKTOP_EVENT_TRANSPORT_STATE, payload)
+            .map_err(|error| error.to_string()),
+        RuntimeEvent::RuntimeDiagnosticsUpdated(payload) => app_handle
+            .emit(DESKTOP_EVENT_RUNTIME_DIAGNOSTICS, payload)
             .map_err(|error| error.to_string()),
         RuntimeEvent::TransportError { message } => app_handle
             .emit(DESKTOP_EVENT_TRANSPORT_ERROR, message)

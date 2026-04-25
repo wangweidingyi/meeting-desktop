@@ -4,6 +4,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useLiveSession } from "@/features/session/hooks/use-live-session";
+import { RuntimeInfoSheet } from "@/features/session/components/runtime-info-sheet";
 import { LiveSummaryPanel } from "@/features/summary/components/live-summary-panel";
 import { TranscriptStreamPanel } from "@/features/transcript/components/transcript-stream-panel";
 
@@ -104,6 +105,8 @@ export function LiveMeetingPage() {
           停止
         </Button>
       </section>
+
+      <RuntimeInfoSheet />
     </div>
   );
 }

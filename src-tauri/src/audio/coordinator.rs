@@ -110,8 +110,8 @@ impl AudioCoordinator {
             .expected_sources
             .iter()
             .cloned()
-        .filter(|source| !self.registered_sources.contains(source))
-        .collect()
+            .filter(|source| !self.registered_sources.contains(source))
+            .collect()
     }
 
     pub fn expected_sources(&self) -> &[CaptureSourceKind] {

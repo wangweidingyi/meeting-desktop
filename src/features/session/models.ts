@@ -3,6 +3,14 @@ import type { SummaryViewState } from "@/features/summary/models";
 
 export type SessionConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting";
 
+export type AudioUplinkState =
+  | "idle"
+  | "waiting_for_audio"
+  | "replaying"
+  | "streaming"
+  | "paused"
+  | "stopped";
+
 export type SessionViewStatus =
   | "idle"
   | "connecting"
@@ -26,6 +34,22 @@ export type SessionViewState = {
     isTranscribing: boolean;
     isSummarizing: boolean;
     isFlushing: boolean;
+  };
+  runtimeInfo: {
+    audioTargetAddr: string | null;
+    audioUplinkState: AudioUplinkState;
+    lastUploadedMixedMs: number;
+    lastChunkSequence: number | null;
+    lastChunkSentAt: string | null;
+    replayFromMs: number | null;
+    replayUntilMs: number | null;
+    lastTransportError: string | null;
+    mqttBrokerUrl: string | null;
+    controlClientId: string | null;
+    adminApiBaseUrl: string | null;
+    sttProvider: string | null;
+    sttModel: string | null;
+    sttResourceId: string | null;
   };
 };
 

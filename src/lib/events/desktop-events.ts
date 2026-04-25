@@ -1,5 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AudioUplinkState,
   DesktopMeetingRecord,
   SessionConnectionState,
   SessionViewStatus,
@@ -11,6 +12,7 @@ export const DESKTOP_EVENT_SUMMARY_DELTA = "meeting://summary-delta";
 export const DESKTOP_EVENT_ACTION_ITEMS_DELTA = "meeting://action-items-delta";
 export const DESKTOP_EVENT_TRANSPORT_STATE = "meeting://transport-state";
 export const DESKTOP_EVENT_TRANSPORT_ERROR = "meeting://transport-error";
+export const DESKTOP_EVENT_RUNTIME_DIAGNOSTICS = "meeting://runtime-diagnostics";
 
 export type DesktopSessionSnapshotPayload = {
   meeting: DesktopMeetingRecord | null;
@@ -96,4 +98,23 @@ export function listenTransportState(
 
 export function listenTransportError(handler: (message: string) => void): Promise<UnlistenFn> {
   return listen<string>(DESKTOP_EVENT_TRANSPORT_ERROR, (event) => handler(event.payload));
+}
+
+export type DesktopRuntimeDiagnosticsPayload = {
+  session_id: string;
+  audio_target_addr: string;
+  audio_uplink_state: AudioUplinkState;
+  last_uploaded_mixed_ms: number;
+  last_chunk_sequence: number | null;
+  last_chunk_sent_at: string | null;
+  replay_from_ms: number | null;
+  replay_until_ms: number | null;
+};
+
+export function listenRuntimeDiagnostics(
+  handler: (payload: DesktopRuntimeDiagnosticsPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<DesktopRuntimeDiagnosticsPayload>(DESKTOP_EVENT_RUNTIME_DIAGNOSTICS, (event) =>
+    handler(event.payload),
+  );
 }

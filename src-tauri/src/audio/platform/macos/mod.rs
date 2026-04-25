@@ -290,9 +290,9 @@ fn resample_to_target_rate(samples: &[i16], source_rate_hz: u32, target_rate_hz:
         return samples.to_vec();
     }
 
-    let target_len =
-        ((samples.len() as f64) * f64::from(target_rate_hz) / f64::from(source_rate_hz)).round()
-            as usize;
+    let target_len = ((samples.len() as f64) * f64::from(target_rate_hz)
+        / f64::from(source_rate_hz))
+    .round() as usize;
     let last_index = samples.len().saturating_sub(1);
 
     (0..target_len)

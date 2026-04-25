@@ -87,6 +87,7 @@ mod tests {
     use crate::audio::coordinator::{AudioCoordinatorConfig, CaptureSourceKind};
     use crate::audio::platform::windows::{AudioDeviceDescriptor, CaptureStreamDescriptor};
     use crate::audio::runtime::MeetingAudioRuntime;
+    use crate::events::bus::EventBus;
     use crate::storage::checkpoint_repo::CheckpointRepo;
     use crate::storage::db::Database;
     use crate::transport::udp_audio::{InMemoryUdpSocket, UdpAudioTransport};
@@ -127,6 +128,8 @@ mod tests {
             unique_temp_dir("runtime"),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
         );
         runtime.prepare().unwrap();
         runtime.start_capture().unwrap();

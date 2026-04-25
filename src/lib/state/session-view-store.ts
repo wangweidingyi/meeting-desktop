@@ -2,6 +2,7 @@ import { create } from "zustand";
 
 import type { MeetingDetailView } from "@/features/meetings/models";
 import type {
+  AudioUplinkState,
   DesktopMeetingRecord,
   SessionConnectionState,
   SessionViewState,
@@ -33,6 +34,22 @@ export function createInitialSessionViewState(): SessionViewState {
       isTranscribing: false,
       isSummarizing: false,
       isFlushing: false,
+    },
+    runtimeInfo: {
+      audioTargetAddr: null,
+      audioUplinkState: "idle",
+      lastUploadedMixedMs: 0,
+      lastChunkSequence: null,
+      lastChunkSentAt: null,
+      replayFromMs: null,
+      replayUntilMs: null,
+      lastTransportError: null,
+      mqttBrokerUrl: null,
+      controlClientId: null,
+      adminApiBaseUrl: null,
+      sttProvider: null,
+      sttModel: null,
+      sttResourceId: null,
     },
   };
 }
@@ -83,6 +100,25 @@ type SessionViewStore = SessionViewState & {
   applyTranscriptSegment: (segment: TranscriptSegmentView) => void;
   applySummarySnapshot: (summary: SummaryViewState) => void;
   applyActionItems: (version: number, items: string[], isFinal: boolean, updatedAtLabel: string) => void;
+  applyRuntimeDiagnostics: (payload: {
+    audioTargetAddr: string;
+    audioUplinkState: AudioUplinkState;
+    lastUploadedMixedMs: number;
+    lastChunkSequence: number | null;
+    lastChunkSentAt: string | null;
+    replayFromMs: number | null;
+    replayUntilMs: number | null;
+  }) => void;
+  applyBackendRuntimeInfo: (payload: {
+    audioTargetAddr: string | null;
+    mqttBrokerUrl: string | null;
+    controlClientId: string | null;
+    adminApiBaseUrl: string | null;
+    sttProvider: string | null;
+    sttModel: string | null;
+    sttResourceId: string | null;
+  }) => void;
+  setLastTransportError: (message: string | null) => void;
 };
 
 export const useSessionViewStore = create<SessionViewStore>((set) => ({
@@ -203,5 +239,41 @@ export const useSessionViewStore = create<SessionViewStore>((set) => ({
         },
       };
     });
+  },
+  applyRuntimeDiagnostics: (payload) => {
+    set((state) => ({
+      runtimeInfo: {
+        ...state.runtimeInfo,
+        audioTargetAddr: payload.audioTargetAddr,
+        audioUplinkState: payload.audioUplinkState,
+        lastUploadedMixedMs: payload.lastUploadedMixedMs,
+        lastChunkSequence: payload.lastChunkSequence,
+        lastChunkSentAt: payload.lastChunkSentAt,
+        replayFromMs: payload.replayFromMs,
+        replayUntilMs: payload.replayUntilMs,
+      },
+    }));
+  },
+  applyBackendRuntimeInfo: (payload) => {
+    set((state) => ({
+      runtimeInfo: {
+        ...state.runtimeInfo,
+        audioTargetAddr: payload.audioTargetAddr ?? state.runtimeInfo.audioTargetAddr,
+        mqttBrokerUrl: payload.mqttBrokerUrl,
+        controlClientId: payload.controlClientId,
+        adminApiBaseUrl: payload.adminApiBaseUrl,
+        sttProvider: payload.sttProvider,
+        sttModel: payload.sttModel,
+        sttResourceId: payload.sttResourceId,
+      },
+    }));
+  },
+  setLastTransportError: (message) => {
+    set((state) => ({
+      runtimeInfo: {
+        ...state.runtimeInfo,
+        lastTransportError: message,
+      },
+    }));
   },
 }));

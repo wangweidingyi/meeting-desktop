@@ -36,6 +36,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::meeting_commands::create_meeting,
+            commands::meeting_commands::get_runtime_backend_info,
             commands::meeting_commands::list_recoverable_meetings,
             commands::meeting_commands::start_active_meeting,
             commands::meeting_commands::resume_recoverable_meeting,
