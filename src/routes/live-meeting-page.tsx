@@ -10,6 +10,15 @@ import { TranscriptStreamPanel } from "@/features/transcript/components/transcri
 
 export function LiveMeetingPage() {
   const { session, pauseMeeting, resumeMeeting, startMeeting, stopMeeting } = useLiveSession();
+  const transcriptFlowLabel = session.flags.isTranscribing ? "转写实时回流中" : "转写待命中";
+  const summaryFlowLabel = session.summary.isFinal
+    ? "纪要已完成整理"
+    : session.flags.isSummarizing
+      ? "纪要异步整理中"
+      : "纪要待命中";
+  const sessionFlowHint = session.summary.isFinal
+    ? "最终纪要已经和最终转写对齐。"
+    : "转写会优先实时显示，纪要会基于最新转写异步补齐。";
   const connectionTone =
     session.connectionState === "connected"
       ? { label: "控制链路稳定", icon: Wifi, variant: "default" as const }
@@ -44,6 +53,7 @@ export function LiveMeetingPage() {
               <p className="mt-2 text-sm text-slate-500">
                 {startedAtLabel} · 当前会持续显示转写和纪要增量
               </p>
+              <p className="mt-2 text-sm leading-6 text-slate-600">{sessionFlowHint}</p>
             </div>
           </div>
 
@@ -55,10 +65,10 @@ export function LiveMeetingPage() {
                 {session.status === "recording" ? "录音中" : "待开始"}
               </Badge>
               <Badge variant="outline" className="border-white/20 bg-white/5 text-white">
-                {session.flags.isTranscribing ? "转写中" : "转写待命"}
+                {transcriptFlowLabel}
               </Badge>
               <Badge variant="outline" className="border-white/20 bg-white/5 text-white">
-                {session.flags.isSummarizing ? "纪要生成中" : "纪要待命"}
+                {summaryFlowLabel}
               </Badge>
             </div>
           </div>
@@ -79,7 +89,7 @@ export function LiveMeetingPage() {
         <Card className="border border-black/5 bg-white/85">
           <CardHeader>
             <CardTitle>实时会议纪要</CardTitle>
-            <CardDescription>会中纪要和会后 final 纪要会按版本合并。</CardDescription>
+            <CardDescription>转写先实时显示，纪要会基于最新转写异步刷新。</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <LiveSummaryPanel summary={session.summary} />
