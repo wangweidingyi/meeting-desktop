@@ -5,6 +5,22 @@ type TranscriptStreamPanelProps = {
   segments: TranscriptSegmentView[];
 };
 
+function formatTranscriptOffset(offsetMs: number) {
+  const totalSeconds = Math.max(0, Math.floor(offsetMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function segmentTimeLabel(segment: TranscriptSegmentView) {
+  if (segment.id.endsWith("-transcript")) {
+    return `已转写至 ${formatTranscriptOffset(segment.endMs)}`;
+  }
+
+  return `${formatTranscriptOffset(segment.startMs)} - ${formatTranscriptOffset(segment.endMs)}`;
+}
+
 export function TranscriptStreamPanel({ segments }: TranscriptStreamPanelProps) {
   if (segments.length === 0) {
     return (
@@ -22,9 +38,7 @@ export function TranscriptStreamPanel({ segments }: TranscriptStreamPanelProps) 
           className="rounded-2xl border border-black/5 bg-slate-50/80 px-4 py-3 text-sm leading-7 text-slate-700"
         >
           <div className="mb-2 flex items-center gap-2 text-xs text-slate-500">
-            <span>
-              {segment.startMs}ms - {segment.endMs}ms
-            </span>
+            <span>{segmentTimeLabel(segment)}</span>
             <Badge variant={segment.isFinal ? "default" : "secondary"} className="rounded-full px-2 py-0 text-[11px]">
               {segment.isFinal ? "Final" : `Rev ${segment.revision}`}
             </Badge>

@@ -17,6 +17,40 @@ function makeSegment(overrides: Partial<TranscriptSegmentView> = {}): Transcript
 }
 
 describe("TranscriptStreamPanel", () => {
+  it("shows live transcript snapshots as covered progress instead of a raw range", () => {
+    render(
+      <TranscriptStreamPanel
+        segments={[
+          makeSegment({
+            id: "meeting-1-transcript",
+            startMs: 0,
+            endMs: 61_200,
+            revision: 3,
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("已转写至 01:01")).toBeInTheDocument();
+    expect(screen.queryByText("00:00 - 01:01")).not.toBeInTheDocument();
+  });
+
+  it("shows discrete transcript segments as formatted time ranges", () => {
+    render(
+      <TranscriptStreamPanel
+        segments={[
+          makeSegment({
+            id: "segment-2",
+            startMs: 5_000,
+            endMs: 8_400,
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("00:05 - 00:08")).toBeInTheDocument();
+  });
+
   it("renders the latest segment revision in place", () => {
     const { rerender } = render(
       <TranscriptStreamPanel segments={[makeSegment()]} />,
