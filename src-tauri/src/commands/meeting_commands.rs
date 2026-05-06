@@ -162,12 +162,12 @@ fn start_current_active_meeting(state: &State<'_, AppState>) -> Result<MeetingRe
 
         if let Some(runtime) = audio_runtime.as_mut() {
             if let Err(error) = runtime.start_capture() {
-                cleanup_failed_session_start(&state)?;
+                report_failed_session_start_cleanup(&state, &error);
                 return Err(error);
             }
 
             if let Err(error) = runtime.replay_pending_mixed_audio() {
-                cleanup_failed_session_start(&state)?;
+                report_failed_session_start_cleanup(&state, &error);
                 return Err(error);
             }
         }
@@ -459,6 +459,16 @@ fn pause_session_recording(state: &State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+fn report_failed_session_start_cleanup(state: &State<'_, AppState>, original_error: &str) {
+    if let Err(cleanup_error) = cleanup_failed_session_start(state) {
+        let _ = state.events.publish(RuntimeEvent::TransportError {
+            message: format!(
+                "failed to clean up session after startup failed: {original_error}; cleanup error: {cleanup_error}"
+            ),
+        });
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn start_platform_audio_capture(state: &State<'_, AppState>) -> Result<(), String> {
     let enumerator = WindowsAudioDeviceEnumerator;
@@ -675,10 +685,32 @@ fn cleanup_failed_session_start(state: &State<'_, AppState>) -> Result<(), Strin
         .lock()
         .map_err(|lock_error| lock_error.to_string())?;
     if let Some(session_runtime) = session_runtime.as_ref() {
-        let _ = session_runtime.control_transport().stop_recording();
-        let _ = session_runtime.control_transport().disconnect();
+        return combine_cleanup_results(
+            session_runtime.control_transport().stop_recording(),
+            session_runtime.control_transport().disconnect(),
+        );
     }
     Ok(())
+}
+
+fn combine_cleanup_results<S, D>(
+    stop_result: Result<S, String>,
+    disconnect_result: Result<D, String>,
+) -> Result<(), String> {
+    let mut cleanup_errors = Vec::new();
+
+    if let Err(error) = stop_result {
+        cleanup_errors.push(format!("stop recording failed: {error}"));
+    }
+    if let Err(error) = disconnect_result {
+        cleanup_errors.push(format!("disconnect failed: {error}"));
+    }
+
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(cleanup_errors.join("; "))
+    }
 }
 
 fn publish_audio_uplink_state(
@@ -749,7 +781,8 @@ mod tests {
     use super::{
         build_audio_coordinator_config, build_macos_capture_startup_plan,
         build_macos_source_runtime_sink, build_platform_capture_failure_cleanup_plan,
-        ControlFailureCleanup, MacosMicrophoneSinkMode, PlatformCaptureFailureContext,
+        combine_cleanup_results, ControlFailureCleanup, MacosMicrophoneSinkMode,
+        PlatformCaptureFailureContext,
     };
     use crate::audio::coordinator::{
         AudioCoordinatorConfig, AudioUplinkStrategy, CaptureSourceKind,
@@ -862,6 +895,22 @@ mod tests {
         assert!(!plan.stop_audio_runtime);
         assert_eq!(plan.control_cleanup, ControlFailureCleanup::PauseRecording);
         assert_eq!(plan.publish_uplink_state, Some(AudioUplinkState::Paused));
+    }
+
+    #[test]
+    fn cleanup_error_aggregation_reports_stop_and_disconnect_failures() {
+        let result = combine_cleanup_results(
+            Result::<(), String>::Err("stop failed".to_string()),
+            Result::<(), String>::Err("disconnect failed".to_string()),
+        );
+
+        assert_eq!(
+            result,
+            Err(
+                "stop recording failed: stop failed; disconnect failed: disconnect failed"
+                    .to_string()
+            )
+        );
     }
 
     #[test]
