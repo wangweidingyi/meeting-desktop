@@ -7,6 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, Stream, StreamConfig};
 
+pub mod system_audio;
+pub use system_audio::MacosSystemCaptureRuntime;
+
 pub type PcmFrameCallback = Arc<dyn Fn(u64, Vec<i16>) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,12 +33,6 @@ impl StoppableCapture for MacosCaptureRuntime {
     fn stop(&self) {
         MacosCaptureRuntime::stop(self);
     }
-}
-
-pub struct MacosSystemCaptureRuntime;
-
-impl MacosSystemCaptureRuntime {
-    pub fn stop(&self) {}
 }
 
 impl StoppableCapture for MacosSystemCaptureRuntime {
