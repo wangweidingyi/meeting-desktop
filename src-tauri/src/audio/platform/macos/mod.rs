@@ -22,6 +22,64 @@ pub struct MacosCaptureRuntime {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
+trait StoppableCapture: Send + Sync {
+    fn stop(&self);
+}
+
+impl StoppableCapture for MacosCaptureRuntime {
+    fn stop(&self) {
+        MacosCaptureRuntime::stop(self);
+    }
+}
+
+pub struct MacosSystemCaptureRuntime;
+
+impl MacosSystemCaptureRuntime {
+    pub fn stop(&self) {}
+}
+
+impl StoppableCapture for MacosSystemCaptureRuntime {
+    fn stop(&self) {
+        MacosSystemCaptureRuntime::stop(self);
+    }
+}
+
+pub struct MacosPlatformCaptureRuntime {
+    microphone: Box<dyn StoppableCapture>,
+    system_audio: Option<Box<dyn StoppableCapture>>,
+}
+
+impl MacosPlatformCaptureRuntime {
+    pub fn new(
+        microphone: MacosCaptureRuntime,
+        system_audio: Option<MacosSystemCaptureRuntime>,
+    ) -> Self {
+        Self {
+            microphone: Box::new(microphone),
+            system_audio: system_audio
+                .map(|runtime| Box::new(runtime) as Box<dyn StoppableCapture>),
+        }
+    }
+
+    pub fn stop(&self) {
+        self.microphone.stop();
+        if let Some(system_audio) = &self.system_audio {
+            system_audio.stop();
+        }
+    }
+
+    #[cfg(test)]
+    fn from_stoppable_handles_for_test(
+        microphone: Box<dyn StoppableCapture>,
+        system_audio: Option<Box<dyn StoppableCapture>>,
+    ) -> Self {
+        Self {
+            microphone,
+            system_audio,
+        }
+    }
+}
+
 impl MacosCaptureRuntime {
     fn new(
         descriptor: MacosCaptureStreamDescriptor,
@@ -313,7 +371,26 @@ fn resample_to_target_rate(samples: &[i16], source_rate_hz: u32, target_rate_hz:
 
 #[cfg(test)]
 mod tests {
-    use super::{downmix_to_mono, resample_to_target_rate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::{
+        downmix_to_mono, resample_to_target_rate, MacosPlatformCaptureRuntime, StoppableCapture,
+    };
+
+    struct TestCaptureHandle {
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    impl StoppableCapture for TestCaptureHandle {
+        fn stop(&self) {
+            self.stop_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn test_handle(stop_count: Arc<AtomicUsize>) -> Box<dyn StoppableCapture> {
+        Box::new(TestCaptureHandle { stop_count })
+    }
 
     #[test]
     fn normalize_helpers_downmix_and_resample_microphone_frames() {
@@ -323,5 +400,35 @@ mod tests {
 
         assert_eq!(mono, vec![2000, 3000, 4000, 5000]);
         assert_eq!(resampled, vec![2000]);
+    }
+
+    #[test]
+    fn macos_platform_capture_runtime_stops_all_handles() {
+        let microphone_stopped = Arc::new(AtomicUsize::new(0));
+        let system_stopped = Arc::new(AtomicUsize::new(0));
+
+        let runtime = MacosPlatformCaptureRuntime::from_stoppable_handles_for_test(
+            test_handle(microphone_stopped.clone()),
+            Some(test_handle(system_stopped.clone())),
+        );
+
+        runtime.stop();
+
+        assert_eq!(microphone_stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(system_stopped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn macos_platform_capture_runtime_allows_missing_system_handle() {
+        let microphone_stopped = Arc::new(AtomicUsize::new(0));
+
+        let runtime = MacosPlatformCaptureRuntime::from_stoppable_handles_for_test(
+            test_handle(microphone_stopped.clone()),
+            None,
+        );
+
+        runtime.stop();
+
+        assert_eq!(microphone_stopped.load(Ordering::SeqCst), 1);
     }
 }

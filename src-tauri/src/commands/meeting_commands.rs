@@ -27,7 +27,9 @@ pub struct RuntimeBackendInfo {
 }
 
 #[cfg(target_os = "macos")]
-use crate::audio::platform::macos::{MacosMicrophoneCapture, PcmFrameCallback};
+use crate::audio::platform::macos::{
+    MacosMicrophoneCapture, MacosPlatformCaptureRuntime, PcmFrameCallback,
+};
 #[cfg(target_os = "windows")]
 use crate::audio::platform::windows::device_enumerator::WindowsAudioDeviceEnumerator;
 #[cfg(target_os = "windows")]
@@ -390,7 +392,9 @@ fn start_platform_audio_capture(state: &State<'_, AppState>) -> Result<(), Strin
         .platform_capture_runtime
         .lock()
         .map_err(|error| error.to_string())?;
-    *platform_capture_runtime = Some(PlatformCaptureRuntime::Macos(microphone_runtime));
+    *platform_capture_runtime = Some(PlatformCaptureRuntime::Macos(
+        MacosPlatformCaptureRuntime::new(microphone_runtime, None),
+    ));
 
     Ok(())
 }
@@ -547,7 +551,7 @@ fn publish_session_snapshot(
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{build_audio_coordinator_config, build_macos_source_runtime_sink};
@@ -560,8 +564,6 @@ mod tests {
     use crate::storage::checkpoint_repo::CheckpointRepo;
     use crate::storage::db::Database;
     use crate::transport::udp_audio::{InMemoryUdpSocket, UdpAudioTransport};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -611,12 +613,10 @@ mod tests {
     }
 
     #[test]
-    fn macos_dev_mirror_mode_switches_to_dual_source_mixed_uplink() {
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    fn macos_mirror_mode_switches_to_dual_source_mixed_uplink() {
+        let mut runtime_config = BackendRuntimeConfig::default();
+        runtime_config.macos_system_audio_mode = MacosSystemAudioMode::MirrorMicrophone;
 
-        std::env::set_var("MEETING_MACOS_DEV_SYSTEM_AUDIO", "mirror_microphone");
-
-        let runtime_config = BackendRuntimeConfig::from_env().unwrap();
         let config = build_audio_coordinator_config(&runtime_config, "meeting-dev");
 
         assert_eq!(
@@ -627,8 +627,6 @@ mod tests {
             ]
         );
         assert_eq!(config.uplink_strategy, AudioUplinkStrategy::MixedDualSource);
-
-        std::env::remove_var("MEETING_MACOS_DEV_SYSTEM_AUDIO");
     }
 
     #[test]

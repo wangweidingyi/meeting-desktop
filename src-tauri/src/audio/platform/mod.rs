@@ -7,7 +7,7 @@ pub enum PlatformCaptureRuntime {
     #[cfg(target_os = "windows")]
     Windows(windows::WindowsCaptureRuntime),
     #[cfg(target_os = "macos")]
-    Macos(macos::MacosCaptureRuntime),
+    Macos(macos::MacosPlatformCaptureRuntime),
 }
 
 impl PlatformCaptureRuntime {
