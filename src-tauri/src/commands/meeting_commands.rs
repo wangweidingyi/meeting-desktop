@@ -530,7 +530,7 @@ mod tests {
 
     use super::build_audio_coordinator_config;
     use crate::audio::coordinator::{AudioUplinkStrategy, CaptureSourceKind};
-    use crate::config::BackendRuntimeConfig;
+    use crate::config::{BackendRuntimeConfig, MacosSystemAudioMode};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -553,5 +553,36 @@ mod tests {
         assert_eq!(config.uplink_strategy, AudioUplinkStrategy::MixedDualSource);
 
         std::env::remove_var("MEETING_MACOS_DEV_SYSTEM_AUDIO");
+    }
+
+    #[test]
+    fn macos_system_mode_switches_to_dual_source_mixed_uplink() {
+        let mut runtime_config = BackendRuntimeConfig::default();
+        runtime_config.macos_system_audio_mode = MacosSystemAudioMode::System;
+
+        let config = build_audio_coordinator_config(&runtime_config, "meeting-system");
+
+        assert_eq!(
+            config.expected_sources,
+            vec![
+                CaptureSourceKind::Microphone,
+                CaptureSourceKind::SystemLoopback,
+            ]
+        );
+        assert_eq!(config.uplink_strategy, AudioUplinkStrategy::MixedDualSource);
+    }
+
+    #[test]
+    fn macos_disabled_mode_keeps_microphone_passthrough() {
+        let mut runtime_config = BackendRuntimeConfig::default();
+        runtime_config.macos_system_audio_mode = MacosSystemAudioMode::Disabled;
+
+        let config = build_audio_coordinator_config(&runtime_config, "meeting-mic");
+
+        assert_eq!(config.expected_sources, vec![CaptureSourceKind::Microphone]);
+        assert_eq!(
+            config.uplink_strategy,
+            AudioUplinkStrategy::PassthroughSingleSource(CaptureSourceKind::Microphone)
+        );
     }
 }
