@@ -173,7 +173,10 @@ fn start_current_active_meeting(state: &State<'_, AppState>) -> Result<MeetingRe
         }
     }
 
-    start_platform_audio_capture(state)?;
+    if let Err(error) = start_platform_audio_capture(state) {
+        cleanup_failed_platform_capture_start(state, &error);
+        return Err(error);
+    }
 
     mutate_active_meeting(
         state,
@@ -216,7 +219,10 @@ pub fn resume_active_meeting(state: State<'_, AppState>) -> Result<MeetingRecord
         }
     }
 
-    start_platform_audio_capture(&state)?;
+    if let Err(error) = start_platform_audio_capture(&state) {
+        compensate_failed_platform_capture_resume(&state, &error);
+        return Err(error);
+    }
     publish_audio_uplink_state(&state, AudioUplinkState::WaitingForAudio)?;
     mutate_active_meeting(&state, &[SessionEvent::ResumeRequested])
 }
@@ -325,6 +331,131 @@ fn stop_platform_capture_runtime(state: &State<'_, AppState>) -> Result<(), Stri
         runtime.stop();
     }
     *platform_capture_runtime = None;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlatformCaptureFailureContext {
+    StartMeeting,
+    ResumeMeeting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlFailureCleanup {
+    StopRecordingAndDisconnect,
+    PauseRecording,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlatformCaptureFailureCleanupPlan {
+    stop_audio_runtime: bool,
+    control_cleanup: ControlFailureCleanup,
+    publish_uplink_state: Option<AudioUplinkState>,
+}
+
+fn build_platform_capture_failure_cleanup_plan(
+    context: PlatformCaptureFailureContext,
+) -> PlatformCaptureFailureCleanupPlan {
+    match context {
+        PlatformCaptureFailureContext::StartMeeting => PlatformCaptureFailureCleanupPlan {
+            stop_audio_runtime: true,
+            control_cleanup: ControlFailureCleanup::StopRecordingAndDisconnect,
+            publish_uplink_state: None,
+        },
+        PlatformCaptureFailureContext::ResumeMeeting => PlatformCaptureFailureCleanupPlan {
+            stop_audio_runtime: false,
+            control_cleanup: ControlFailureCleanup::PauseRecording,
+            publish_uplink_state: Some(AudioUplinkState::Paused),
+        },
+    }
+}
+
+fn cleanup_failed_platform_capture_start(state: &State<'_, AppState>, original_error: &str) {
+    let plan =
+        build_platform_capture_failure_cleanup_plan(PlatformCaptureFailureContext::StartMeeting);
+    if let Err(cleanup_error) = apply_platform_capture_failure_cleanup(state, &plan) {
+        let _ = state.events.publish(RuntimeEvent::TransportError {
+            message: format!(
+                "failed to clean up session after platform capture startup failed: {original_error}; cleanup error: {cleanup_error}"
+            ),
+        });
+    }
+}
+
+fn compensate_failed_platform_capture_resume(state: &State<'_, AppState>, original_error: &str) {
+    let plan =
+        build_platform_capture_failure_cleanup_plan(PlatformCaptureFailureContext::ResumeMeeting);
+    if let Err(cleanup_error) = apply_platform_capture_failure_cleanup(state, &plan) {
+        let _ = state.events.publish(RuntimeEvent::TransportError {
+            message: format!(
+                "failed to pause session after platform capture resume failed: {original_error}; cleanup error: {cleanup_error}"
+            ),
+        });
+    }
+}
+
+fn apply_platform_capture_failure_cleanup(
+    state: &State<'_, AppState>,
+    plan: &PlatformCaptureFailureCleanupPlan,
+) -> Result<(), String> {
+    let mut cleanup_errors = Vec::new();
+    let mut control_cleanup_succeeded = true;
+
+    if plan.stop_audio_runtime {
+        if let Err(error) = stop_active_audio_runtime(state) {
+            cleanup_errors.push(format!("audio runtime stop failed: {error}"));
+        }
+    }
+
+    match plan.control_cleanup {
+        ControlFailureCleanup::StopRecordingAndDisconnect => {
+            if let Err(error) = cleanup_failed_session_start(state) {
+                control_cleanup_succeeded = false;
+                cleanup_errors.push(format!("session cleanup failed: {error}"));
+            }
+        }
+        ControlFailureCleanup::PauseRecording => {
+            if let Err(error) = pause_session_recording(state) {
+                control_cleanup_succeeded = false;
+                cleanup_errors.push(format!("session pause failed: {error}"));
+            }
+        }
+    }
+
+    if control_cleanup_succeeded {
+        if let Some(uplink_state) = plan.publish_uplink_state.clone() {
+            if let Err(error) = publish_audio_uplink_state(state, uplink_state) {
+                cleanup_errors.push(format!("audio uplink state publish failed: {error}"));
+            }
+        }
+    }
+
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(cleanup_errors.join("; "))
+    }
+}
+
+fn stop_active_audio_runtime(state: &State<'_, AppState>) -> Result<(), String> {
+    let audio_runtime = state
+        .audio_runtime
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(runtime) = audio_runtime.as_ref() {
+        runtime.stop()?;
+    }
+    Ok(())
+}
+
+fn pause_session_recording(state: &State<'_, AppState>) -> Result<(), String> {
+    let session_runtime = state
+        .session_runtime
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if let Some(runtime) = session_runtime.as_ref() {
+        runtime.control_transport().pause_recording()?;
+    }
     Ok(())
 }
 
@@ -617,7 +748,8 @@ mod tests {
 
     use super::{
         build_audio_coordinator_config, build_macos_capture_startup_plan,
-        build_macos_source_runtime_sink, MacosMicrophoneSinkMode,
+        build_macos_source_runtime_sink, build_platform_capture_failure_cleanup_plan,
+        ControlFailureCleanup, MacosMicrophoneSinkMode, PlatformCaptureFailureContext,
     };
     use crate::audio::coordinator::{
         AudioCoordinatorConfig, AudioUplinkStrategy, CaptureSourceKind,
@@ -625,6 +757,7 @@ mod tests {
     use crate::audio::runtime::MeetingAudioRuntime;
     use crate::config::{BackendRuntimeConfig, MacosSystemAudioMode};
     use crate::events::bus::EventBus;
+    use crate::events::types::AudioUplinkState;
     use crate::storage::checkpoint_repo::CheckpointRepo;
     use crate::storage::db::Database;
     use crate::transport::udp_audio::{InMemoryUdpSocket, UdpAudioTransport};
@@ -704,6 +837,31 @@ mod tests {
 
         assert_eq!(plan.microphone_sink, MacosMicrophoneSinkMode::Mirror);
         assert!(!plan.start_system_audio);
+    }
+
+    #[test]
+    fn start_meeting_platform_capture_failure_stops_audio_and_remote_session() {
+        let plan = build_platform_capture_failure_cleanup_plan(
+            PlatformCaptureFailureContext::StartMeeting,
+        );
+
+        assert!(plan.stop_audio_runtime);
+        assert_eq!(
+            plan.control_cleanup,
+            ControlFailureCleanup::StopRecordingAndDisconnect
+        );
+        assert_eq!(plan.publish_uplink_state, None);
+    }
+
+    #[test]
+    fn resume_platform_capture_failure_pauses_remote_session_and_uplink() {
+        let plan = build_platform_capture_failure_cleanup_plan(
+            PlatformCaptureFailureContext::ResumeMeeting,
+        );
+
+        assert!(!plan.stop_audio_runtime);
+        assert_eq!(plan.control_cleanup, ControlFailureCleanup::PauseRecording);
+        assert_eq!(plan.publish_uplink_state, Some(AudioUplinkState::Paused));
     }
 
     #[test]
