@@ -28,7 +28,8 @@ pub struct RuntimeBackendInfo {
 
 #[cfg(target_os = "macos")]
 use crate::audio::platform::macos::{
-    MacosMicrophoneCapture, MacosPlatformCaptureRuntime, PcmFrameCallback,
+    system_audio::MacosSystemAudioCapture, MacosMicrophoneCapture, MacosPlatformCaptureRuntime,
+    PcmFrameCallback,
 };
 #[cfg(target_os = "windows")]
 use crate::audio::platform::windows::device_enumerator::WindowsAudioDeviceEnumerator;
@@ -373,27 +374,87 @@ fn start_platform_audio_capture(state: &State<'_, AppState>) -> Result<(), Strin
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosMicrophoneSinkMode {
+    MicrophoneOnly,
+    Mirror,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacosCaptureStartupPlan {
+    microphone_sink: MacosMicrophoneSinkMode,
+    start_system_audio: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_capture_startup_plan(mode: MacosSystemAudioMode) -> MacosCaptureStartupPlan {
+    match mode {
+        MacosSystemAudioMode::Disabled => MacosCaptureStartupPlan {
+            microphone_sink: MacosMicrophoneSinkMode::MicrophoneOnly,
+            start_system_audio: false,
+        },
+        MacosSystemAudioMode::MirrorMicrophone => MacosCaptureStartupPlan {
+            microphone_sink: MacosMicrophoneSinkMode::Mirror,
+            start_system_audio: false,
+        },
+        MacosSystemAudioMode::System => MacosCaptureStartupPlan {
+            microphone_sink: MacosMicrophoneSinkMode::MicrophoneOnly,
+            start_system_audio: true,
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn start_platform_audio_capture(state: &State<'_, AppState>) -> Result<(), String> {
     let microphone_capture = MacosMicrophoneCapture::default()?;
-    let sink = match state.runtime_config.macos_system_audio_mode {
-        MacosSystemAudioMode::Disabled | MacosSystemAudioMode::System => {
-            build_macos_source_runtime_sink(
-                state.audio_runtime.clone(),
-                CaptureSourceKind::Microphone,
-            )
-        }
-        MacosSystemAudioMode::MirrorMicrophone => {
+    let plan =
+        build_macos_capture_startup_plan(state.runtime_config.macos_system_audio_mode.clone());
+    let sink = match plan.microphone_sink {
+        MacosMicrophoneSinkMode::MicrophoneOnly => build_macos_source_runtime_sink(
+            state.audio_runtime.clone(),
+            CaptureSourceKind::Microphone,
+        ),
+        MacosMicrophoneSinkMode::Mirror => {
             build_macos_mirror_runtime_sink(state.audio_runtime.clone())
         }
     };
     let microphone_runtime = microphone_capture.start_with_sink(sink)?;
+    let system_runtime = if plan.start_system_audio {
+        let system_capture = match MacosSystemAudioCapture::default() {
+            Ok(capture) => capture,
+            Err(error) => {
+                microphone_runtime.stop();
+                return Err(error);
+            }
+        };
+        let system_sink = build_macos_source_runtime_sink(
+            state.audio_runtime.clone(),
+            CaptureSourceKind::SystemLoopback,
+        );
+        match system_capture.start_with_sink(system_sink) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                microphone_runtime.stop();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
 
-    let mut platform_capture_runtime = state
-        .platform_capture_runtime
-        .lock()
-        .map_err(|error| error.to_string())?;
+    let mut platform_capture_runtime = match state.platform_capture_runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            microphone_runtime.stop();
+            if let Some(system_runtime) = &system_runtime {
+                system_runtime.stop();
+            }
+            return Err(error.to_string());
+        }
+    };
     *platform_capture_runtime = Some(PlatformCaptureRuntime::Macos(
-        MacosPlatformCaptureRuntime::new(microphone_runtime, None),
+        MacosPlatformCaptureRuntime::new(microphone_runtime, system_runtime),
     ));
 
     Ok(())
@@ -554,7 +615,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build_audio_coordinator_config, build_macos_source_runtime_sink};
+    use super::{
+        build_audio_coordinator_config, build_macos_capture_startup_plan,
+        build_macos_source_runtime_sink, MacosMicrophoneSinkMode,
+    };
     use crate::audio::coordinator::{
         AudioCoordinatorConfig, AudioUplinkStrategy, CaptureSourceKind,
     };
@@ -610,6 +674,36 @@ mod tests {
 
         assert_eq!(checkpoint.last_uploaded_mixed_ms, 1_200);
         assert_eq!(checkpoint.last_udp_seq_sent, 0);
+    }
+
+    #[test]
+    fn macos_system_mode_starts_microphone_and_system_audio() {
+        let plan = build_macos_capture_startup_plan(MacosSystemAudioMode::System);
+
+        assert_eq!(
+            plan.microphone_sink,
+            MacosMicrophoneSinkMode::MicrophoneOnly
+        );
+        assert!(plan.start_system_audio);
+    }
+
+    #[test]
+    fn macos_disabled_mode_starts_only_microphone_passthrough() {
+        let plan = build_macos_capture_startup_plan(MacosSystemAudioMode::Disabled);
+
+        assert_eq!(
+            plan.microphone_sink,
+            MacosMicrophoneSinkMode::MicrophoneOnly
+        );
+        assert!(!plan.start_system_audio);
+    }
+
+    #[test]
+    fn macos_mirror_microphone_mode_uses_mirror_sink_without_system_audio() {
+        let plan = build_macos_capture_startup_plan(MacosSystemAudioMode::MirrorMicrophone);
+
+        assert_eq!(plan.microphone_sink, MacosMicrophoneSinkMode::Mirror);
+        assert!(!plan.start_system_audio);
     }
 
     #[test]

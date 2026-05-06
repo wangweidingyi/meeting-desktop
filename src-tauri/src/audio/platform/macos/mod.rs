@@ -66,6 +66,11 @@ impl MacosPlatformCaptureRuntime {
     }
 
     #[cfg(test)]
+    pub fn has_system_audio(&self) -> bool {
+        self.system_audio.is_some()
+    }
+
+    #[cfg(test)]
     fn from_stoppable_handles_for_test(
         microphone: Box<dyn StoppableCapture>,
         system_audio: Option<Box<dyn StoppableCapture>>,
@@ -413,6 +418,7 @@ mod tests {
 
         assert_eq!(microphone_stopped.load(Ordering::SeqCst), 1);
         assert_eq!(system_stopped.load(Ordering::SeqCst), 1);
+        assert!(runtime.has_system_audio());
     }
 
     #[test]
@@ -427,5 +433,6 @@ mod tests {
         runtime.stop();
 
         assert_eq!(microphone_stopped.load(Ordering::SeqCst), 1);
+        assert!(!runtime.has_system_audio());
     }
 }
