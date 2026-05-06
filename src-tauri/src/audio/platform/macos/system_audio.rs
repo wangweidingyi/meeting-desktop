@@ -11,6 +11,7 @@ use super::PcmFrameCallback;
 
 const TARGET_SAMPLE_RATE_HZ: u32 = 16_000;
 const ERROR_BUFFER_LEN: usize = 1024;
+const SYSTEM_AUDIO_QUEUE_CAPACITY: usize = 8;
 
 type MeetingSystemAudioCallback = unsafe extern "C" fn(
     user_data: *mut c_void,
@@ -54,7 +55,7 @@ struct MacosSystemCaptureHandle {
 
 struct BridgeCallbackState {
     active: AtomicBool,
-    frame_tx: Mutex<Option<mpsc::Sender<RawSystemAudioFrame>>>,
+    frame_tx: Mutex<Option<mpsc::SyncSender<RawSystemAudioFrame>>>,
 }
 
 struct RawSystemAudioFrame {
@@ -62,6 +63,37 @@ struct RawSystemAudioFrame {
     samples: Vec<f32>,
     sample_rate_hz: u32,
     channels: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueResult {
+    Queued,
+    Dropped,
+    Closed,
+}
+
+impl EnqueueResult {
+    #[cfg(test)]
+    fn is_queued(self) -> bool {
+        matches!(self, Self::Queued)
+    }
+
+    #[cfg(test)]
+    fn is_dropped(self) -> bool {
+        matches!(self, Self::Dropped)
+    }
+}
+
+struct StreamPcmConverter {
+    target_sample_rate_hz: u32,
+    resampler: Option<StreamResampler>,
+}
+
+struct StreamResampler {
+    source_rate_hz: u32,
+    target_rate_hz: u32,
+    source_position: f64,
+    pending: Vec<f32>,
 }
 
 unsafe impl Send for MacosSystemCaptureHandle {}
@@ -154,13 +186,95 @@ pub fn convert_f32_interleaved_to_pcm16_mono(
     let resampled =
         resample_to_target_rate(&mono, descriptor.sample_rate_hz, target_sample_rate_hz);
 
-    Ok(resampled
-        .into_iter()
-        .map(|sample| {
-            let clamped = sample.clamp(-1.0, 1.0);
-            (clamped * f32::from(i16::MAX)).round() as i16
-        })
-        .collect())
+    Ok(resampled.into_iter().map(f32_to_pcm16).collect())
+}
+
+impl StreamPcmConverter {
+    fn new(target_sample_rate_hz: u32) -> Self {
+        Self {
+            target_sample_rate_hz,
+            resampler: None,
+        }
+    }
+
+    fn convert(
+        &mut self,
+        descriptor: &MacosSystemAudioDescriptor,
+        samples: &[f32],
+    ) -> Result<Vec<i16>, String> {
+        if descriptor.sample_rate_hz == 0 || self.target_sample_rate_hz == 0 {
+            return Err("sample rate must be non-zero".to_string());
+        }
+        if descriptor.channels == 0 {
+            return Err("source channels must be non-zero".to_string());
+        }
+
+        let mono = downmix_f32_interleaved_to_mono(descriptor, samples);
+        let resampler = self.resampler.get_or_insert_with(|| {
+            StreamResampler::new(descriptor.sample_rate_hz, self.target_sample_rate_hz)
+        });
+        if resampler.source_rate_hz != descriptor.sample_rate_hz
+            || resampler.target_rate_hz != self.target_sample_rate_hz
+        {
+            *resampler =
+                StreamResampler::new(descriptor.sample_rate_hz, self.target_sample_rate_hz);
+        }
+
+        Ok(resampler
+            .process(&mono)
+            .into_iter()
+            .map(f32_to_pcm16)
+            .collect())
+    }
+}
+
+impl StreamResampler {
+    fn new(source_rate_hz: u32, target_rate_hz: u32) -> Self {
+        Self {
+            source_rate_hz,
+            target_rate_hz,
+            source_position: 0.0,
+            pending: Vec::new(),
+        }
+    }
+
+    fn process(&mut self, samples: &[f32]) -> Vec<f32> {
+        if samples.is_empty() || self.source_rate_hz == 0 || self.target_rate_hz == 0 {
+            return Vec::new();
+        }
+        if self.source_rate_hz == self.target_rate_hz {
+            return samples.to_vec();
+        }
+
+        self.pending.extend_from_slice(samples);
+        let source_step = f64::from(self.source_rate_hz) / f64::from(self.target_rate_hz);
+        let mut resampled = Vec::new();
+
+        while self.source_position + 1.0 < self.pending.len() as f64 {
+            let source_index = self.source_position.floor() as usize;
+            let next_index = (source_index + 1).min(self.pending.len().saturating_sub(1));
+            let fraction = self.source_position - source_index as f64;
+            let current = self.pending[source_index] as f64;
+            let next = self.pending[next_index] as f64;
+
+            resampled.push((current + ((next - current) * fraction)) as f32);
+            self.source_position += source_step;
+        }
+
+        let consumed = self.source_position.floor() as usize;
+        if consumed > 0 {
+            let drain_count = consumed.min(self.pending.len());
+            self.pending.drain(..drain_count);
+            self.source_position -= drain_count as f64;
+        }
+
+        resampled
+    }
+}
+
+fn f32_to_pcm16(sample: f32) -> i16 {
+    let clamped = sample.clamp(-1.0, 1.0);
+    (clamped * f32::from(i16::MAX)).round() as i16
 }
 
 fn downmix_f32_interleaved_to_mono(
@@ -245,7 +359,7 @@ fn start_core_audio_system_tap(
 fn build_callback_worker(
     sink: PcmFrameCallback,
 ) -> Result<(Arc<BridgeCallbackState>, JoinHandle<()>), String> {
-    let (frame_tx, frame_rx) = mpsc::channel();
+    let (frame_tx, frame_rx) = mpsc::sync_channel(SYSTEM_AUDIO_QUEUE_CAPACITY);
     let callback_state = Arc::new(BridgeCallbackState {
         active: AtomicBool::new(true),
         frame_tx: Mutex::new(Some(frame_tx)),
@@ -264,13 +378,15 @@ fn run_system_audio_worker(
     frame_rx: mpsc::Receiver<RawSystemAudioFrame>,
     sink: PcmFrameCallback,
 ) {
+    let mut converter = StreamPcmConverter::new(TARGET_SAMPLE_RATE_HZ);
+
     while let Ok(frame) = frame_rx.recv() {
         if !callback_state.active.load(Ordering::SeqCst) {
             continue;
         }
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            forward_system_audio_samples(&callback_state, &sink, frame);
+            forward_system_audio_samples(&callback_state, &sink, &mut converter, frame);
         }));
 
         if result.is_err() {
@@ -309,9 +425,9 @@ fn enqueue_system_audio_samples(
     samples: &[f32],
     sample_rate_hz: u32,
     channels: u16,
-) {
+) -> EnqueueResult {
     if !callback_state.active.load(Ordering::SeqCst) {
-        return;
+        return EnqueueResult::Closed;
     }
 
     let frame = RawSystemAudioFrame {
@@ -325,12 +441,14 @@ fn enqueue_system_audio_samples(
         .frame_tx
         .lock()
         .ok()
-        .and_then(|frame_tx| frame_tx.as_ref().map(|frame_tx| frame_tx.send(frame)));
+        .and_then(|frame_tx| frame_tx.as_ref().map(|frame_tx| frame_tx.try_send(frame)));
 
     match send_result {
-        Some(Ok(())) => {}
-        _ => {
+        Some(Ok(())) => EnqueueResult::Queued,
+        Some(Err(mpsc::TrySendError::Full(_))) => EnqueueResult::Dropped,
+        Some(Err(mpsc::TrySendError::Disconnected(_))) | None => {
             callback_state.active.store(false, Ordering::SeqCst);
+            EnqueueResult::Closed
         }
     }
 }
@@ -338,6 +456,7 @@ fn enqueue_system_audio_samples(
 fn forward_system_audio_samples(
     callback_state: &BridgeCallbackState,
     sink: &PcmFrameCallback,
+    converter: &mut StreamPcmConverter,
     frame: RawSystemAudioFrame,
 ) {
     if !callback_state.active.load(Ordering::SeqCst) {
@@ -348,11 +467,7 @@ fn forward_system_audio_samples(
         sample_rate_hz: frame.sample_rate_hz,
         channels: frame.channels,
     };
-    let pcm = match convert_f32_interleaved_to_pcm16_mono(
-        &descriptor,
-        &frame.samples,
-        TARGET_SAMPLE_RATE_HZ,
-    ) {
+    let pcm = match converter.convert(&descriptor, &frame.samples) {
         Ok(pcm) if !pcm.is_empty() => pcm,
         _ => return,
     };
@@ -401,6 +516,40 @@ fn invoke_system_audio_callback_for_test(
 }
 
 #[cfg(test)]
+fn build_callback_state_for_test(
+    capacity: usize,
+) -> (
+    Arc<BridgeCallbackState>,
+    mpsc::Receiver<RawSystemAudioFrame>,
+) {
+    let (frame_tx, frame_rx) = mpsc::sync_channel(capacity);
+    (
+        Arc::new(BridgeCallbackState {
+            active: AtomicBool::new(true),
+            frame_tx: Mutex::new(Some(frame_tx)),
+        }),
+        frame_rx,
+    )
+}
+
+#[cfg(test)]
+fn enqueue_system_audio_samples_for_state_test(
+    callback_state: &BridgeCallbackState,
+    started_at_ms: u64,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    channels: u16,
+) -> EnqueueResult {
+    enqueue_system_audio_samples(
+        callback_state,
+        started_at_ms,
+        samples,
+        sample_rate_hz,
+        channels,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -409,8 +558,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        convert_f32_interleaved_to_pcm16_mono, invoke_system_audio_callback_for_test,
-        MacosSystemAudioDescriptor, MacosSystemCaptureRuntime,
+        build_callback_state_for_test, convert_f32_interleaved_to_pcm16_mono,
+        enqueue_system_audio_samples_for_state_test, invoke_system_audio_callback_for_test,
+        MacosSystemAudioDescriptor, MacosSystemCaptureRuntime, StreamPcmConverter,
     };
     use crate::audio::platform::macos::PcmFrameCallback;
 
@@ -442,6 +592,42 @@ mod tests {
         assert_eq!(pcm.len(), 160);
         assert_eq!(pcm.first(), Some(&16_384));
         assert_eq!(pcm.last(), Some(&16_384));
+    }
+
+    #[test]
+    fn stream_resampler_keeps_44100hz_phase_across_512_frame_chunks() {
+        let mut converter = StreamPcmConverter::new(16_000);
+        let descriptor = MacosSystemAudioDescriptor {
+            sample_rate_hz: 44_100,
+            channels: 1,
+        };
+        let samples = vec![0.5; 44_100];
+        let mut pcm = Vec::new();
+
+        for chunk in samples.chunks(512) {
+            pcm.extend(converter.convert(&descriptor, chunk).unwrap());
+        }
+
+        assert_eq!(pcm.len(), 16_000);
+        assert!(pcm.iter().all(|sample| *sample == 16_384));
+    }
+
+    #[test]
+    fn stream_resampler_keeps_48000hz_phase_across_512_frame_chunks() {
+        let mut converter = StreamPcmConverter::new(16_000);
+        let descriptor = MacosSystemAudioDescriptor {
+            sample_rate_hz: 48_000,
+            channels: 1,
+        };
+        let samples = vec![0.5; 48_000];
+        let mut pcm = Vec::new();
+
+        for chunk in samples.chunks(512) {
+            pcm.extend(converter.convert(&descriptor, chunk).unwrap());
+        }
+
+        assert_eq!(pcm.len(), 16_000);
+        assert!(pcm.iter().all(|sample| *sample == 16_384));
     }
 
     #[test]
@@ -514,5 +700,32 @@ mod tests {
         invoke_system_audio_callback_for_test(&runtime, 1_000, &[0.5; 6], 48_000, 2);
 
         runtime.stop();
+    }
+
+    #[test]
+    fn system_audio_enqueue_drops_when_queue_is_full_without_blocking() {
+        let (callback_state, _frame_rx) =
+            build_callback_state_for_test(super::SYSTEM_AUDIO_QUEUE_CAPACITY);
+
+        for index in 0..super::SYSTEM_AUDIO_QUEUE_CAPACITY {
+            assert!(enqueue_system_audio_samples_for_state_test(
+                &callback_state,
+                index as u64,
+                &[0.5; 6],
+                48_000,
+                2,
+            )
+            .is_queued());
+        }
+
+        let dropped = enqueue_system_audio_samples_for_state_test(
+            &callback_state,
+            super::SYSTEM_AUDIO_QUEUE_CAPACITY as u64,
+            &[0.5; 6],
+            48_000,
+            2,
+        );
+
+        assert!(dropped.is_dropped());
     }
 }
