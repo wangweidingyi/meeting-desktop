@@ -412,7 +412,7 @@ fn build_macos_audio_coordinator_config(
     meeting_id: &str,
 ) -> AudioCoordinatorConfig {
     match runtime_config.macos_system_audio_mode {
-        MacosSystemAudioMode::MirrorMicrophone => {
+        MacosSystemAudioMode::System | MacosSystemAudioMode::MirrorMicrophone => {
             AudioCoordinatorConfig::new(meeting_id.to_string())
         }
         MacosSystemAudioMode::Disabled => AudioCoordinatorConfig::single_source_passthrough(

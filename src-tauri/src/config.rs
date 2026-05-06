@@ -4,17 +4,17 @@ use std::env;
 pub enum MacosSystemAudioMode {
     #[default]
     Disabled,
+    System,
     MirrorMicrophone,
 }
 
 impl MacosSystemAudioMode {
     fn parse_env_value(value: &str) -> Result<Self, String> {
         match value.trim() {
-            "" => Ok(Self::Disabled),
+            "" | "disabled" => Ok(Self::Disabled),
+            "system" => Ok(Self::System),
             "mirror_microphone" => Ok(Self::MirrorMicrophone),
-            other => Err(format!(
-                "unsupported MEETING_MACOS_DEV_SYSTEM_AUDIO value: {other}"
-            )),
+            other => Err(format!("unsupported macOS system audio mode: {other}")),
         }
     }
 }
@@ -136,7 +136,9 @@ impl BackendRuntimeConfig {
             }
         }
 
-        if let Ok(value) = env::var("MEETING_MACOS_DEV_SYSTEM_AUDIO") {
+        if let Ok(value) = env::var("MEETING_MACOS_SYSTEM_AUDIO") {
+            config.macos_system_audio_mode = MacosSystemAudioMode::parse_env_value(&value)?;
+        } else if let Ok(value) = env::var("MEETING_MACOS_DEV_SYSTEM_AUDIO") {
             config.macos_system_audio_mode = MacosSystemAudioMode::parse_env_value(&value)?;
         }
 
@@ -237,6 +239,38 @@ mod tests {
         std::env::remove_var("MEETING_STT_RESOURCE_ID");
         std::env::remove_var("MEETING_USER_ID");
         std::env::remove_var("MEETING_USER_NAME");
+        std::env::remove_var("MEETING_MACOS_DEV_SYSTEM_AUDIO");
+    }
+
+    #[test]
+    fn runtime_config_reads_new_macos_system_audio_system_mode() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        std::env::set_var("MEETING_MACOS_SYSTEM_AUDIO", "system");
+        std::env::remove_var("MEETING_MACOS_DEV_SYSTEM_AUDIO");
+
+        let config = BackendRuntimeConfig::from_env().unwrap();
+
+        assert_eq!(config.macos_system_audio_mode, MacosSystemAudioMode::System);
+
+        std::env::remove_var("MEETING_MACOS_SYSTEM_AUDIO");
+    }
+
+    #[test]
+    fn runtime_config_prefers_new_macos_system_audio_env_over_dev_env() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        std::env::set_var("MEETING_MACOS_SYSTEM_AUDIO", "disabled");
+        std::env::set_var("MEETING_MACOS_DEV_SYSTEM_AUDIO", "mirror_microphone");
+
+        let config = BackendRuntimeConfig::from_env().unwrap();
+
+        assert_eq!(
+            config.macos_system_audio_mode,
+            MacosSystemAudioMode::Disabled
+        );
+
+        std::env::remove_var("MEETING_MACOS_SYSTEM_AUDIO");
         std::env::remove_var("MEETING_MACOS_DEV_SYSTEM_AUDIO");
     }
 
