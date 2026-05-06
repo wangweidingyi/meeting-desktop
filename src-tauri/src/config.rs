@@ -17,6 +17,14 @@ impl MacosSystemAudioMode {
             other => Err(format!("unsupported macOS system audio mode: {other}")),
         }
     }
+
+    pub fn runtime_diagnostics_value(&self) -> &'static str {
+        match self {
+            Self::Disabled => "microphone_only",
+            Self::System => "system",
+            Self::MirrorMicrophone => "mirror_microphone",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

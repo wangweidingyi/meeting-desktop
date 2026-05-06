@@ -11,6 +11,11 @@ export type AudioUplinkState =
   | "paused"
   | "stopped";
 
+export type MacosAudioCaptureMode =
+  | "microphone_only"
+  | "mirror_microphone"
+  | "system";
+
 export type SessionViewStatus =
   | "idle"
   | "connecting"
@@ -38,6 +43,7 @@ export type SessionViewState = {
   runtimeInfo: {
     audioTargetAddr: string | null;
     audioUplinkState: AudioUplinkState;
+    macosAudioCaptureMode: MacosAudioCaptureMode | null;
     lastUploadedMixedMs: number;
     lastChunkSequence: number | null;
     lastChunkSentAt: string | null;

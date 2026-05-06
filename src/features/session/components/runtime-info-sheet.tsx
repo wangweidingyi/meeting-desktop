@@ -11,7 +11,11 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import type { AudioUplinkState, SessionConnectionState } from "@/features/session/models";
+import type {
+  AudioUplinkState,
+  MacosAudioCaptureMode,
+  SessionConnectionState,
+} from "@/features/session/models";
 import { cn } from "@/lib/utils";
 import { useSessionViewStore } from "@/lib/state/session-view-store";
 
@@ -29,6 +33,12 @@ const connectionStateLabelMap: Record<SessionConnectionState, string> = {
   connecting: "控制链路连接中",
   connected: "控制链路稳定",
   reconnecting: "控制链路重连中",
+};
+
+const macosAudioCaptureModeLabelMap: Record<MacosAudioCaptureMode, string> = {
+  microphone_only: "仅麦克风",
+  mirror_microphone: "镜像麦克风",
+  system: "全系统输出",
 };
 
 function formatAudioDuration(durationMs: number) {
@@ -194,6 +204,15 @@ export function RuntimeInfoSheet() {
             >
               <div className="grid gap-3 sm:grid-cols-2">
                 <ValueCard label="当前状态" value={audioStateLabelMap[runtimeInfo.audioUplinkState]} />
+                <ValueCard
+                  hint="这里会区分当前是只录麦克风、镜像调试模式，还是正在抓取 macOS 的真实系统输出。"
+                  label="系统音频"
+                  value={
+                    runtimeInfo.macosAudioCaptureMode
+                      ? macosAudioCaptureModeLabelMap[runtimeInfo.macosAudioCaptureMode]
+                      : "未提供"
+                  }
+                />
                 <ValueCard
                   hint="按当前会议开始时间换算后的已上行位置，用来确认音频实际已经送到哪里。"
                   label="已上行到"

@@ -2,6 +2,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AudioUplinkState,
   DesktopMeetingRecord,
+  MacosAudioCaptureMode,
   SessionConnectionState,
   SessionViewStatus,
 } from "@/features/session/models";
@@ -104,6 +105,7 @@ export type DesktopRuntimeDiagnosticsPayload = {
   session_id: string;
   audio_target_addr: string;
   audio_uplink_state: AudioUplinkState;
+  macos_audio_capture_mode: MacosAudioCaptureMode | null;
   last_uploaded_mixed_ms: number;
   last_chunk_sequence: number | null;
   last_chunk_sent_at: string | null;

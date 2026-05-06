@@ -343,7 +343,7 @@ fn start_core_audio_system_tap(
         callback_state.active.store(false, Ordering::SeqCst);
         callback_state.close();
         let _ = worker.join();
-        return Err(read_error_buffer(&error_buffer));
+        return Err(format_start_error(&read_error_buffer(&error_buffer)));
     }
 
     Ok(MacosSystemCaptureRuntime {
@@ -498,6 +498,29 @@ fn read_error_buffer(error_buffer: &[c_char]) -> String {
     }
 }
 
+fn format_start_error(message: &str) -> String {
+    if message.contains("requires macOS 14.2 or newer") {
+        return "macOS system audio capture requires a supported macOS version with Core Audio process taps.".to_string();
+    }
+
+    if looks_like_permission_denied(message) {
+        return format!(
+            "macOS denied system audio capture permission. Grant recording permission and retry. Native error: {message}"
+        );
+    }
+
+    format!("failed to start macOS system audio capture: {message}")
+}
+
+fn looks_like_permission_denied(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("permission")
+        || normalized.contains("not permitted")
+        || normalized.contains("denied")
+        || message.contains("OSStatus -54")
+        || message.contains("('perm')")
+}
+
 #[cfg(test)]
 fn invoke_system_audio_callback_for_test(
     runtime: &MacosSystemCaptureRuntime,
@@ -559,6 +582,7 @@ mod tests {
 
     use super::{
         build_callback_state_for_test, convert_f32_interleaved_to_pcm16_mono,
+        format_start_error,
         enqueue_system_audio_samples_for_state_test, invoke_system_audio_callback_for_test,
         MacosSystemAudioDescriptor, MacosSystemCaptureRuntime, StreamPcmConverter,
     };
@@ -727,5 +751,38 @@ mod tests {
         );
 
         assert!(dropped.is_dropped());
+    }
+
+    #[test]
+    fn format_start_error_explains_unsupported_os() {
+        let error = format_start_error("macOS system audio capture requires macOS 14.2 or newer");
+
+        assert_eq!(
+            error,
+            "macOS system audio capture requires a supported macOS version with Core Audio process taps."
+        );
+    }
+
+    #[test]
+    fn format_start_error_explains_permission_denied() {
+        let error =
+            format_start_error("AudioDeviceStart failed with OSStatus -54 ('perm')");
+
+        assert_eq!(
+            error,
+            "macOS denied system audio capture permission. Grant recording permission and retry. Native error: AudioDeviceStart failed with OSStatus -54 ('perm')"
+        );
+    }
+
+    #[test]
+    fn format_start_error_preserves_native_status_codes() {
+        let error = format_start_error(
+            "AudioHardwareCreateAggregateDevice failed with OSStatus 1852797029 ('what')",
+        );
+
+        assert_eq!(
+            error,
+            "failed to start macOS system audio capture: AudioHardwareCreateAggregateDevice failed with OSStatus 1852797029 ('what')"
+        );
     }
 }

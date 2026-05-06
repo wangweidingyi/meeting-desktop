@@ -4,6 +4,7 @@ import type { MeetingDetailView } from "@/features/meetings/models";
 import type {
   AudioUplinkState,
   DesktopMeetingRecord,
+  MacosAudioCaptureMode,
   SessionConnectionState,
   SessionViewState,
   SessionViewStatus,
@@ -38,6 +39,7 @@ export function createInitialSessionViewState(): SessionViewState {
     runtimeInfo: {
       audioTargetAddr: null,
       audioUplinkState: "idle",
+      macosAudioCaptureMode: null,
       lastUploadedMixedMs: 0,
       lastChunkSequence: null,
       lastChunkSentAt: null,
@@ -103,6 +105,7 @@ type SessionViewStore = SessionViewState & {
   applyRuntimeDiagnostics: (payload: {
     audioTargetAddr: string;
     audioUplinkState: AudioUplinkState;
+    macosAudioCaptureMode: MacosAudioCaptureMode | null;
     lastUploadedMixedMs: number;
     lastChunkSequence: number | null;
     lastChunkSentAt: string | null;
@@ -246,6 +249,7 @@ export const useSessionViewStore = create<SessionViewStore>((set) => ({
         ...state.runtimeInfo,
         audioTargetAddr: payload.audioTargetAddr,
         audioUplinkState: payload.audioUplinkState,
+        macosAudioCaptureMode: payload.macosAudioCaptureMode,
         lastUploadedMixedMs: payload.lastUploadedMixedMs,
         lastChunkSequence: payload.lastChunkSequence,
         lastChunkSentAt: payload.lastChunkSentAt,

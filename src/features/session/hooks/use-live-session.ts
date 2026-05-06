@@ -86,6 +86,7 @@ function applyRuntimeDiagnostics(payload: DesktopRuntimeDiagnosticsPayload) {
   useSessionViewStore.getState().applyRuntimeDiagnostics({
     audioTargetAddr: payload.audio_target_addr,
     audioUplinkState: payload.audio_uplink_state,
+    macosAudioCaptureMode: payload.macos_audio_capture_mode,
     lastUploadedMixedMs: payload.last_uploaded_mixed_ms,
     lastChunkSequence: payload.last_chunk_sequence,
     lastChunkSentAt: payload.last_chunk_sent_at,

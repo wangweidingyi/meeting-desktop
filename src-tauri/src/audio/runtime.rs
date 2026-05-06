@@ -39,6 +39,7 @@ where
     uplink_strategy: AudioUplinkStrategy,
     event_bus: EventBus,
     audio_target_addr: String,
+    macos_audio_capture_mode: Option<String>,
 }
 
 impl<T> MeetingAudioRuntime<T>
@@ -75,7 +76,12 @@ where
             uplink_strategy,
             event_bus,
             audio_target_addr,
+            macos_audio_capture_mode: None,
         }
+    }
+
+    pub fn set_macos_audio_capture_mode(&mut self, mode: Option<String>) {
+        self.macos_audio_capture_mode = mode;
     }
 
     pub fn prepare(&mut self) -> Result<(), String> {
@@ -472,6 +478,7 @@ where
                     session_id: self.meeting_id.clone(),
                     audio_target_addr: self.audio_target_addr.clone(),
                     audio_uplink_state,
+                    macos_audio_capture_mode: self.macos_audio_capture_mode.clone(),
                     last_uploaded_mixed_ms,
                     last_chunk_sequence,
                     last_chunk_sent_at,
@@ -797,6 +804,7 @@ mod tests {
             event_bus.clone(),
             "127.0.0.1:6000".to_string(),
         );
+        runtime.set_macos_audio_capture_mode(Some("system".to_string()));
 
         runtime.prepare().unwrap();
         runtime.start_capture().unwrap();
@@ -811,6 +819,7 @@ mod tests {
                 if payload.session_id == "meeting-1"
                     && payload.audio_target_addr == "127.0.0.1:6000"
                     && payload.audio_uplink_state == crate::events::types::AudioUplinkState::Streaming
+                    && payload.macos_audio_capture_mode.as_deref() == Some("system")
                     && payload.last_uploaded_mixed_ms == 1_200
                     && payload.last_chunk_sequence == Some(0)
         )));

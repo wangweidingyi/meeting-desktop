@@ -22,6 +22,7 @@ describe("RuntimeInfoSheet", () => {
       runtimeInfo: {
         audioTargetAddr: "127.0.0.1:6000",
         audioUplinkState: "streaming",
+        macosAudioCaptureMode: "system",
         lastUploadedMixedMs: 1777031710400,
         lastChunkSequence: 8,
         lastChunkSentAt: "2026-04-23T15:00:12Z",
@@ -48,6 +49,8 @@ describe("RuntimeInfoSheet", () => {
     expect(screen.getByText("meeting-desktop")).toBeInTheDocument();
     expect(screen.getByText("volcengine_streaming")).toBeInTheDocument();
     expect(screen.getByText("bigmodel")).toBeInTheDocument();
+    expect(screen.getByText("系统音频")).toBeInTheDocument();
+    expect(screen.getByText("全系统输出")).toBeInTheDocument();
     expect(screen.getAllByText("实时上行中").length).toBeGreaterThan(0);
     expect(screen.getByText("38.4 秒")).toBeInTheDocument();
     expect(screen.getByText("控制链路稳定")).toBeInTheDocument();
@@ -65,6 +68,7 @@ describe("RuntimeInfoSheet", () => {
       runtimeInfo: {
         audioTargetAddr: "127.0.0.1:6000",
         audioUplinkState: "streaming",
+        macosAudioCaptureMode: "microphone_only",
         lastUploadedMixedMs: 2000,
         lastChunkSequence: 3,
         lastChunkSentAt: "2026-04-24T20:00:02Z",

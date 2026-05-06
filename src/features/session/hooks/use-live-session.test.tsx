@@ -299,6 +299,7 @@ describe("useLiveSession", () => {
         session_id: "meeting-1",
         audio_target_addr: "127.0.0.1:6000",
         audio_uplink_state: "streaming",
+        macos_audio_capture_mode: "system",
         last_uploaded_mixed_ms: 12400,
         last_chunk_sequence: 8,
         last_chunk_sent_at: "2026-04-23T08:00:00Z",
@@ -310,6 +311,7 @@ describe("useLiveSession", () => {
     const state = useSessionViewStore.getState();
     expect(state.runtimeInfo.audioTargetAddr).toBe("127.0.0.1:6000");
     expect(state.runtimeInfo.audioUplinkState).toBe("streaming");
+    expect(state.runtimeInfo.macosAudioCaptureMode).toBe("system");
     expect(state.runtimeInfo.lastUploadedMixedMs).toBe(12400);
     expect(state.runtimeInfo.lastChunkSequence).toBe(8);
     expect(state.runtimeInfo.lastChunkSentAt).toBe("2026-04-23T08:00:00Z");

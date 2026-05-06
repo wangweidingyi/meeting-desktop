@@ -74,6 +74,7 @@ pub struct RuntimeDiagnosticsPayload {
     pub session_id: String,
     pub audio_target_addr: String,
     pub audio_uplink_state: AudioUplinkState,
+    pub macos_audio_capture_mode: Option<String>,
     pub last_uploaded_mixed_ms: u64,
     pub last_chunk_sequence: Option<u64>,
     pub last_chunk_sent_at: Option<String>,

@@ -277,6 +277,9 @@ fn prepare_runtime_for_meeting(
         state.events.clone(),
         transport.audio_target_addr().to_string(),
     );
+    audio_runtime.set_macos_audio_capture_mode(build_runtime_diagnostics_capture_mode(
+        &state.runtime_config,
+    ));
     audio_runtime.prepare()?;
 
     let mut session_runtime = state
@@ -320,6 +323,26 @@ fn clear_runtime_handles(state: &State<'_, AppState>) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn build_runtime_diagnostics_capture_mode(
+    runtime_config: &BackendRuntimeConfig,
+) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(
+            runtime_config
+                .macos_system_audio_mode
+                .runtime_diagnostics_value()
+                .to_string(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = runtime_config;
+        None
+    }
 }
 
 fn stop_platform_capture_runtime(state: &State<'_, AppState>) -> Result<(), String> {
