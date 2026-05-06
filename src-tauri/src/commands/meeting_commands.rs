@@ -36,6 +36,8 @@ use crate::audio::platform::windows::loopback_capture::WindowsLoopbackCapture;
 use crate::audio::platform::windows::mic_capture::WindowsMicrophoneCapture;
 #[cfg(target_os = "windows")]
 use crate::audio::platform::windows::runtime_sink::build_runtime_sink;
+#[cfg(target_os = "macos")]
+use crate::transport::audio_transport::AudioTransport;
 
 #[tauri::command]
 pub fn create_meeting(state: State<'_, AppState>, title: String) -> Result<MeetingRecord, String> {
@@ -371,10 +373,17 @@ fn start_platform_audio_capture(state: &State<'_, AppState>) -> Result<(), Strin
 #[cfg(target_os = "macos")]
 fn start_platform_audio_capture(state: &State<'_, AppState>) -> Result<(), String> {
     let microphone_capture = MacosMicrophoneCapture::default()?;
-    let sink = build_macos_runtime_sink(
-        state.audio_runtime.clone(),
-        state.runtime_config.macos_system_audio_mode.clone(),
-    );
+    let sink = match state.runtime_config.macos_system_audio_mode {
+        MacosSystemAudioMode::Disabled | MacosSystemAudioMode::System => {
+            build_macos_source_runtime_sink(
+                state.audio_runtime.clone(),
+                CaptureSourceKind::Microphone,
+            )
+        }
+        MacosSystemAudioMode::MirrorMicrophone => {
+            build_macos_mirror_runtime_sink(state.audio_runtime.clone())
+        }
+    };
     let microphone_runtime = microphone_capture.start_with_sink(sink)?;
 
     let mut platform_capture_runtime = state
@@ -423,14 +432,29 @@ fn build_macos_audio_coordinator_config(
 }
 
 #[cfg(target_os = "macos")]
-fn build_macos_runtime_sink(
-    runtime: std::sync::Arc<
-        std::sync::Mutex<
-            Option<MeetingAudioRuntime<crate::transport::runtime::AudioTransportRuntime>>,
-        >,
-    >,
-    system_audio_mode: MacosSystemAudioMode,
-) -> PcmFrameCallback {
+fn build_macos_source_runtime_sink<T>(
+    runtime: std::sync::Arc<std::sync::Mutex<Option<MeetingAudioRuntime<T>>>>,
+    source: CaptureSourceKind,
+) -> PcmFrameCallback
+where
+    T: AudioTransport + Send + 'static,
+{
+    std::sync::Arc::new(move |started_at_ms, samples| {
+        if let Ok(mut runtime) = runtime.lock() {
+            if let Some(runtime) = runtime.as_mut() {
+                let _ = runtime.push_source_samples(source.clone(), started_at_ms, &samples);
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_mirror_runtime_sink<T>(
+    runtime: std::sync::Arc<std::sync::Mutex<Option<MeetingAudioRuntime<T>>>>,
+) -> PcmFrameCallback
+where
+    T: AudioTransport + Send + 'static,
+{
     std::sync::Arc::new(move |started_at_ms, samples| {
         if let Ok(mut runtime) = runtime.lock() {
             if let Some(runtime) = runtime.as_mut() {
@@ -439,14 +463,11 @@ fn build_macos_runtime_sink(
                     started_at_ms,
                     &samples,
                 );
-
-                if system_audio_mode == MacosSystemAudioMode::MirrorMicrophone {
-                    let _ = runtime.push_source_samples(
-                        CaptureSourceKind::SystemLoopback,
-                        started_at_ms,
-                        &samples,
-                    );
-                }
+                let _ = runtime.push_source_samples(
+                    CaptureSourceKind::SystemLoopback,
+                    started_at_ms,
+                    &samples,
+                );
             }
         }
     })
@@ -526,13 +547,68 @@ fn publish_session_snapshot(
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::build_audio_coordinator_config;
-    use crate::audio::coordinator::{AudioUplinkStrategy, CaptureSourceKind};
+    use super::{build_audio_coordinator_config, build_macos_source_runtime_sink};
+    use crate::audio::coordinator::{
+        AudioCoordinatorConfig, AudioUplinkStrategy, CaptureSourceKind,
+    };
+    use crate::audio::runtime::MeetingAudioRuntime;
     use crate::config::{BackendRuntimeConfig, MacosSystemAudioMode};
+    use crate::events::bus::EventBus;
+    use crate::storage::checkpoint_repo::CheckpointRepo;
+    use crate::storage::db::Database;
+    use crate::transport::udp_audio::{InMemoryUdpSocket, UdpAudioTransport};
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("meeting-macos-runtime-sink-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn macos_source_runtime_sink_pushes_system_loopback_samples() {
+        let database = Database::open_in_memory().unwrap();
+        let mut runtime = MeetingAudioRuntime::new(
+            database.clone(),
+            unique_temp_dir("source"),
+            UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
+            AudioCoordinatorConfig::new("meeting-1"),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
+        );
+        runtime.prepare().unwrap();
+        runtime.start_capture().unwrap();
+
+        let shared = Arc::new(Mutex::new(Some(runtime)));
+        let sink =
+            build_macos_source_runtime_sink(shared.clone(), CaptureSourceKind::SystemLoopback);
+
+        if let Ok(mut guard) = shared.lock() {
+            if let Some(runtime) = guard.as_mut() {
+                runtime
+                    .push_source_samples(CaptureSourceKind::Microphone, 1_000, &vec![1000; 3_200])
+                    .unwrap();
+            }
+        }
+
+        sink(1_000, vec![2000; 3_200]);
+
+        let checkpoint = database
+            .with_connection(|connection| {
+                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(checkpoint.last_uploaded_mixed_ms, 1_200);
+        assert_eq!(checkpoint.last_udp_seq_sent, 0);
+    }
 
     #[test]
     fn macos_dev_mirror_mode_switches_to_dual_source_mixed_uplink() {
