@@ -41,6 +41,8 @@ If `MEETING_SERVER_MQTT_BROKER` is set, the desktop control channel uses a real 
 
 Copy [`.env.example`](/Users/cxc/Documents/open/meeting/meeting-desktop/.env.example) to `.env`.
 
+The real macOS system audio capture bridge uses Core Audio process taps. Building it requires Command Line Tools / a macOS SDK that includes `CoreAudio/AudioHardwareTapping.h` and `CoreAudio/CATapDescription.h`; running real system audio capture requires macOS 14.2 or newer.
+
 Supported desktop variables:
 
 - `MEETING_DESKTOP_CLIENT_ID`

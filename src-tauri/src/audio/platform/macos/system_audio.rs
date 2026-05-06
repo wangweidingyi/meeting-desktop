@@ -1,8 +1,11 @@
 use std::ffi::{c_char, c_void, CStr};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::thread::JoinHandle;
 
 use super::PcmFrameCallback;
 
@@ -46,11 +49,19 @@ struct MacosSystemCaptureHandle {
     callback_state: Arc<BridgeCallbackState>,
     native_handle: Mutex<Option<*mut c_void>>,
     native_callback_state: Mutex<Option<*const BridgeCallbackState>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct BridgeCallbackState {
     active: AtomicBool,
-    sink: PcmFrameCallback,
+    frame_tx: Mutex<Option<mpsc::Sender<RawSystemAudioFrame>>>,
+}
+
+struct RawSystemAudioFrame {
+    started_at_ms: u64,
+    samples: Vec<f32>,
+    sample_rate_hz: u32,
+    channels: u16,
 }
 
 unsafe impl Send for MacosSystemCaptureHandle {}
@@ -76,14 +87,13 @@ impl MacosSystemCaptureRuntime {
 
     #[cfg(test)]
     fn from_test_sink(sink: PcmFrameCallback) -> Self {
+        let (callback_state, worker) = build_callback_worker(sink).unwrap();
         Self {
             inner: Arc::new(MacosSystemCaptureHandle {
-                callback_state: Arc::new(BridgeCallbackState {
-                    active: AtomicBool::new(true),
-                    sink,
-                }),
+                callback_state,
                 native_handle: Mutex::new(None),
                 native_callback_state: Mutex::new(None),
+                worker: Mutex::new(Some(worker)),
             }),
         }
     }
@@ -112,6 +122,14 @@ impl MacosSystemCaptureHandle {
                 }
             }
         }
+
+        self.callback_state.close();
+
+        if let Ok(mut worker) = self.worker.lock() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        }
     }
 }
 
@@ -132,19 +150,11 @@ pub fn convert_f32_interleaved_to_pcm16_mono(
     if descriptor.channels == 0 {
         return Err("source channels must be non-zero".to_string());
     }
-    if descriptor.sample_rate_hz % target_sample_rate_hz != 0 {
-        return Err("source sample rate must be an integer multiple of target rate".to_string());
-    }
-
     let mono = downmix_f32_interleaved_to_mono(descriptor, samples);
-    let ratio = descriptor.sample_rate_hz / target_sample_rate_hz;
-    let downsampled = if ratio <= 1 {
-        mono
-    } else {
-        mono.into_iter().step_by(ratio as usize).collect()
-    };
+    let resampled =
+        resample_to_target_rate(&mono, descriptor.sample_rate_hz, target_sample_rate_hz);
 
-    Ok(downsampled
+    Ok(resampled
         .into_iter()
         .map(|sample| {
             let clamped = sample.clamp(-1.0, 1.0);
@@ -167,13 +177,37 @@ fn downmix_f32_interleaved_to_mono(
         .collect()
 }
 
+fn resample_to_target_rate(samples: &[f32], source_rate_hz: u32, target_rate_hz: u32) -> Vec<f32> {
+    if samples.is_empty() || source_rate_hz == 0 || target_rate_hz == 0 {
+        return Vec::new();
+    }
+    if source_rate_hz == target_rate_hz {
+        return samples.to_vec();
+    }
+
+    let target_len = ((samples.len() as f64) * f64::from(target_rate_hz)
+        / f64::from(source_rate_hz))
+    .round() as usize;
+    let last_index = samples.len().saturating_sub(1);
+
+    (0..target_len)
+        .map(|target_index| {
+            let source_position =
+                (target_index as f64) * f64::from(source_rate_hz) / f64::from(target_rate_hz);
+            let source_index = source_position.floor() as usize;
+            let next_index = (source_index + 1).min(last_index);
+            let fraction = source_position - (source_index as f64);
+            let current = samples[source_index.min(last_index)] as f64;
+            let next = samples[next_index] as f64;
+            (current + ((next - current) * fraction)) as f32
+        })
+        .collect()
+}
+
 fn start_core_audio_system_tap(
     sink: PcmFrameCallback,
 ) -> Result<MacosSystemCaptureRuntime, String> {
-    let callback_state = Arc::new(BridgeCallbackState {
-        active: AtomicBool::new(true),
-        sink,
-    });
+    let (callback_state, worker) = build_callback_worker(sink)?;
     let native_callback_state = Arc::into_raw(callback_state.clone());
     let mut native_handle = ptr::null_mut();
     let mut error_buffer = [0_i8; ERROR_BUFFER_LEN];
@@ -193,6 +227,8 @@ fn start_core_audio_system_tap(
             drop(Arc::from_raw(native_callback_state));
         }
         callback_state.active.store(false, Ordering::SeqCst);
+        callback_state.close();
+        let _ = worker.join();
         return Err(read_error_buffer(&error_buffer));
     }
 
@@ -201,8 +237,48 @@ fn start_core_audio_system_tap(
             callback_state,
             native_handle: Mutex::new(Some(native_handle)),
             native_callback_state: Mutex::new(Some(native_callback_state)),
+            worker: Mutex::new(Some(worker)),
         }),
     })
+}
+
+fn build_callback_worker(
+    sink: PcmFrameCallback,
+) -> Result<(Arc<BridgeCallbackState>, JoinHandle<()>), String> {
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let callback_state = Arc::new(BridgeCallbackState {
+        active: AtomicBool::new(true),
+        frame_tx: Mutex::new(Some(frame_tx)),
+    });
+    let worker_state = callback_state.clone();
+    let worker = thread::Builder::new()
+        .name("meeting-macos-system-audio".to_string())
+        .spawn(move || run_system_audio_worker(worker_state, frame_rx, sink))
+        .map_err(|error| error.to_string())?;
+
+    Ok((callback_state, worker))
+}
+
+fn run_system_audio_worker(
+    callback_state: Arc<BridgeCallbackState>,
+    frame_rx: mpsc::Receiver<RawSystemAudioFrame>,
+    sink: PcmFrameCallback,
+) {
+    while let Ok(frame) = frame_rx.recv() {
+        if !callback_state.active.load(Ordering::SeqCst) {
+            continue;
+        }
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            forward_system_audio_samples(&callback_state, &sink, frame);
+        }));
+
+        if result.is_err() {
+            callback_state.active.store(false, Ordering::SeqCst);
+            callback_state.close();
+            break;
+        }
+    }
 }
 
 unsafe extern "C" fn system_audio_callback(
@@ -218,7 +294,7 @@ unsafe extern "C" fn system_audio_callback(
     }
 
     let callback_state = &*(user_data as *const BridgeCallbackState);
-    forward_system_audio_samples(
+    enqueue_system_audio_samples(
         callback_state,
         started_at_ms,
         slice::from_raw_parts(samples, sample_count),
@@ -227,7 +303,7 @@ unsafe extern "C" fn system_audio_callback(
     );
 }
 
-fn forward_system_audio_samples(
+fn enqueue_system_audio_samples(
     callback_state: &BridgeCallbackState,
     started_at_ms: u64,
     samples: &[f32],
@@ -238,18 +314,59 @@ fn forward_system_audio_samples(
         return;
     }
 
-    let descriptor = MacosSystemAudioDescriptor {
+    let frame = RawSystemAudioFrame {
+        started_at_ms,
+        samples: samples.to_vec(),
         sample_rate_hz,
         channels,
     };
-    let pcm =
-        match convert_f32_interleaved_to_pcm16_mono(&descriptor, samples, TARGET_SAMPLE_RATE_HZ) {
-            Ok(pcm) if !pcm.is_empty() => pcm,
-            _ => return,
-        };
+
+    let send_result = callback_state
+        .frame_tx
+        .lock()
+        .ok()
+        .and_then(|frame_tx| frame_tx.as_ref().map(|frame_tx| frame_tx.send(frame)));
+
+    match send_result {
+        Some(Ok(())) => {}
+        _ => {
+            callback_state.active.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn forward_system_audio_samples(
+    callback_state: &BridgeCallbackState,
+    sink: &PcmFrameCallback,
+    frame: RawSystemAudioFrame,
+) {
+    if !callback_state.active.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let descriptor = MacosSystemAudioDescriptor {
+        sample_rate_hz: frame.sample_rate_hz,
+        channels: frame.channels,
+    };
+    let pcm = match convert_f32_interleaved_to_pcm16_mono(
+        &descriptor,
+        &frame.samples,
+        TARGET_SAMPLE_RATE_HZ,
+    ) {
+        Ok(pcm) if !pcm.is_empty() => pcm,
+        _ => return,
+    };
 
     if callback_state.active.load(Ordering::SeqCst) {
-        (callback_state.sink)(started_at_ms, pcm);
+        (sink)(frame.started_at_ms, pcm);
+    }
+}
+
+impl BridgeCallbackState {
+    fn close(&self) {
+        if let Ok(mut frame_tx) = self.frame_tx.lock() {
+            frame_tx.take();
+        }
     }
 }
 
@@ -274,7 +391,7 @@ fn invoke_system_audio_callback_for_test(
     sample_rate_hz: u32,
     channels: u16,
 ) {
-    forward_system_audio_samples(
+    enqueue_system_audio_samples(
         &runtime.inner.callback_state,
         started_at_ms,
         samples,
@@ -286,7 +403,10 @@ fn invoke_system_audio_callback_for_test(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     use super::{
         convert_f32_interleaved_to_pcm16_mono, invoke_system_audio_callback_for_test,
@@ -307,6 +427,21 @@ mod tests {
         let pcm = convert_f32_interleaved_to_pcm16_mono(&descriptor, &samples, 16_000).unwrap();
 
         assert_eq!(pcm, vec![16_384, 9_830]);
+    }
+
+    #[test]
+    fn convert_f32_interleaved_resamples_44100hz_to_16khz() {
+        let descriptor = MacosSystemAudioDescriptor {
+            sample_rate_hz: 44_100,
+            channels: 1,
+        };
+        let samples = vec![0.5; 441];
+
+        let pcm = convert_f32_interleaved_to_pcm16_mono(&descriptor, &samples, 16_000).unwrap();
+
+        assert_eq!(pcm.len(), 160);
+        assert_eq!(pcm.first(), Some(&16_384));
+        assert_eq!(pcm.last(), Some(&16_384));
     }
 
     #[test]
@@ -335,34 +470,49 @@ mod tests {
     }
 
     #[test]
-    fn convert_f32_interleaved_rejects_non_integer_downsample_ratio() {
-        let descriptor = MacosSystemAudioDescriptor {
-            sample_rate_hz: 44_100,
-            channels: 2,
-        };
-
-        let error =
-            convert_f32_interleaved_to_pcm16_mono(&descriptor, &[0.0, 0.0], 16_000).unwrap_err();
-
-        assert_eq!(
-            error,
-            "source sample rate must be an integer multiple of target rate"
-        );
-    }
-
-    #[test]
     fn system_audio_runtime_stop_disarms_callback_before_releasing_state() {
+        let (delivered_tx, delivered_rx) = mpsc::channel();
         let callback_count = Arc::new(AtomicUsize::new(0));
         let callback_count_for_sink = callback_count.clone();
         let sink: PcmFrameCallback = Arc::new(move |_, samples| {
             callback_count_for_sink.fetch_add(samples.len(), Ordering::SeqCst);
+            delivered_tx.send(()).unwrap();
         });
         let runtime = MacosSystemCaptureRuntime::from_test_sink(sink);
 
-        invoke_system_audio_callback_for_test(&runtime, 1_000, &[0.5, 0.5], 48_000, 2);
+        invoke_system_audio_callback_for_test(&runtime, 1_000, &[0.5; 6], 48_000, 2);
+        delivered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         runtime.stop();
-        invoke_system_audio_callback_for_test(&runtime, 1_010, &[0.5, 0.5], 48_000, 2);
+        invoke_system_audio_callback_for_test(&runtime, 1_010, &[0.5; 6], 48_000, 2);
 
         assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn system_audio_callback_delivers_on_worker_thread() {
+        let callback_thread = thread::current().id();
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let sink: PcmFrameCallback = Arc::new(move |_, _| {
+            thread_tx.send(thread::current().id()).unwrap();
+        });
+        let runtime = MacosSystemCaptureRuntime::from_test_sink(sink);
+
+        invoke_system_audio_callback_for_test(&runtime, 1_000, &[0.5; 6], 48_000, 2);
+
+        let sink_thread = thread_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        runtime.stop();
+        assert_ne!(sink_thread, callback_thread);
+    }
+
+    #[test]
+    fn system_audio_worker_contains_panicking_sink() {
+        let sink: PcmFrameCallback = Arc::new(move |_, _| {
+            panic!("system audio sink panic");
+        });
+        let runtime = MacosSystemCaptureRuntime::from_test_sink(sink);
+
+        invoke_system_audio_callback_for_test(&runtime, 1_000, &[0.5; 6], 48_000, 2);
+
+        runtime.stop();
     }
 }

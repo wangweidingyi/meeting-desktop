@@ -79,6 +79,15 @@ void set_error(char *error_buffer, size_t error_buffer_len, const std::string &m
     std::snprintf(error_buffer, error_buffer_len, "%s", message.c_str());
 }
 
+void log_teardown_status(const char *operation, OSStatus status) {
+    if (status == noErr) {
+        return;
+    }
+
+    std::string message = osstatus_message(operation, status);
+    NSLog(@"Meeting system audio teardown: %s", message.c_str());
+}
+
 bool get_tap_uid(AudioObjectID tap_id, NSString **out_uid, std::string &error) {
     CFStringRef tap_uid = nullptr;
     UInt32 property_size = sizeof(tap_uid);
@@ -346,20 +355,25 @@ extern "C" void meeting_system_audio_stop(void *raw_handle) {
 
     auto *handle = static_cast<MeetingSystemAudioHandle *>(raw_handle);
     if (handle->started && handle->aggregate_device_id != kAudioObjectUnknown) {
-        AudioDeviceStop(handle->aggregate_device_id, handle->io_proc_id);
+        OSStatus status = AudioDeviceStop(handle->aggregate_device_id, handle->io_proc_id);
+        log_teardown_status("AudioDeviceStop", status);
         handle->started = false;
     }
     if (handle->io_proc_id != nullptr && handle->aggregate_device_id != kAudioObjectUnknown) {
-        AudioDeviceDestroyIOProcID(handle->aggregate_device_id, handle->io_proc_id);
+        OSStatus status =
+            AudioDeviceDestroyIOProcID(handle->aggregate_device_id, handle->io_proc_id);
+        log_teardown_status("AudioDeviceDestroyIOProcID", status);
         handle->io_proc_id = nullptr;
     }
     if (handle->aggregate_device_id != kAudioObjectUnknown) {
-        AudioHardwareDestroyAggregateDevice(handle->aggregate_device_id);
+        OSStatus status = AudioHardwareDestroyAggregateDevice(handle->aggregate_device_id);
+        log_teardown_status("AudioHardwareDestroyAggregateDevice", status);
         handle->aggregate_device_id = kAudioObjectUnknown;
     }
     if (handle->tap_id != kAudioObjectUnknown) {
         if (@available(macOS 14.2, *)) {
-            AudioHardwareDestroyProcessTap(handle->tap_id);
+            OSStatus status = AudioHardwareDestroyProcessTap(handle->tap_id);
+            log_teardown_status("AudioHardwareDestroyProcessTap", status);
         }
         handle->tap_id = kAudioObjectUnknown;
     }
