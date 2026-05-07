@@ -11,12 +11,10 @@ use crate::audio::mixer::mix_aligned_sources_to_mono;
 use crate::audio::reader::{pcm16_wave_duration_ms, read_pcm16_wave_window};
 use crate::audio::timeline::{align_stream_start_ms, duration_ms_for_samples};
 use crate::audio::writer::{append_pcm16_wave, AudioAssetPaths};
+use crate::backend_sync::{AudioAssetRecord, SessionCheckpointRecord, SharedMeetingSync};
 use crate::events::bus::EventBus;
 use crate::events::types::{AudioUplinkState, RuntimeDiagnosticsPayload, RuntimeEvent};
 use crate::session::recovery::{plan_recovery, RecoveryPlan};
-use crate::storage::audio_repo::{AudioAssetRecord, AudioRepo};
-use crate::storage::checkpoint_repo::{CheckpointRepo, SessionCheckpointRecord};
-use crate::storage::db::Database;
 use crate::transport::audio_transport::{AudioTransport, AudioUploadProgress};
 
 const DEFAULT_BUFFER_WINDOW_MS: u32 = 30_000;
@@ -27,7 +25,7 @@ pub struct MeetingAudioRuntime<T>
 where
     T: AudioTransport,
 {
-    database: Database,
+    persistence: SharedMeetingSync,
     root_dir: PathBuf,
     transport: T,
     coordinator: AudioCoordinator,
@@ -54,7 +52,7 @@ where
     T: AudioTransport,
 {
     pub fn new(
-        database: Database,
+        persistence: SharedMeetingSync,
         root_dir: PathBuf,
         transport: T,
         config: AudioCoordinatorConfig,
@@ -69,7 +67,7 @@ where
             samples_for_duration_ms(DEFAULT_BUFFER_WINDOW_MS, sample_rate_hz, channels);
 
         Self {
-            database,
+            persistence,
             root_dir,
             transport,
             coordinator: AudioCoordinator::new(config),
@@ -126,35 +124,27 @@ where
         };
         self.asset_paths = Some(assets);
 
-        let checkpoint = self
-            .database
-            .with_connection(|connection| {
-                AudioRepo::upsert(connection, &audio_assets)?;
-                let checkpoint =
-                    match CheckpointRepo::find_by_meeting_id(connection, &self.meeting_id)? {
-                        Some(existing) => SessionCheckpointRecord {
-                            local_recording_state: "prepared".to_string(),
-                            updated_at: current_timestamp_label(),
-                            ..existing
-                        },
-                        None => SessionCheckpointRecord {
-                            meeting_id: self.meeting_id.clone(),
-                            last_control_seq: 0,
-                            last_udp_seq_sent: 0,
-                            last_uploaded_mixed_ms: 0,
-                            last_transcript_segment_revision: 0,
-                            last_summary_version: 0,
-                            last_action_item_version: 0,
-                            local_recording_state: "prepared".to_string(),
-                            recovery_token: None,
-                            updated_at: current_timestamp_label(),
-                        },
-                    };
-
-                CheckpointRepo::upsert(connection, &checkpoint)?;
-                Ok(checkpoint)
-            })
-            .map_err(|error| error.to_string())?;
+        self.persistence.upsert_audio_assets(&audio_assets)?;
+        let checkpoint = match self.persistence.find_checkpoint(&self.meeting_id)? {
+            Some(existing) => SessionCheckpointRecord {
+                local_recording_state: "prepared".to_string(),
+                updated_at: current_timestamp_label(),
+                ..existing
+            },
+            None => SessionCheckpointRecord {
+                meeting_id: self.meeting_id.clone(),
+                last_control_seq: 0,
+                last_udp_seq_sent: 0,
+                last_uploaded_mixed_ms: 0,
+                last_transcript_segment_revision: 0,
+                last_summary_version: 0,
+                last_action_item_version: 0,
+                local_recording_state: "prepared".to_string(),
+                recovery_token: None,
+                updated_at: current_timestamp_label(),
+            },
+        };
+        let checkpoint = self.persistence.upsert_checkpoint(&checkpoint)?;
 
         self.publish_runtime_diagnostics(
             AudioUplinkState::Idle,
@@ -321,16 +311,17 @@ where
         for chunk in chunker.chunk_samples(started_at_ms, samples) {
             let progress = self.transport.send_audio_chunk(&chunk)?;
             let sent_at = current_timestamp_label();
-            self.database
-                .with_connection(|connection| {
-                    CheckpointRepo::record_audio_upload(
-                        connection,
-                        &self.meeting_id,
-                        &progress,
-                        &sent_at,
-                    )
-                })
-                .map_err(|error| error.to_string())?;
+            let existing = self
+                .persistence
+                .find_checkpoint(&self.meeting_id)?
+                .unwrap_or_else(|| default_checkpoint(&self.meeting_id));
+            self.persistence
+                .upsert_checkpoint(&SessionCheckpointRecord {
+                    last_udp_seq_sent: progress.sequence,
+                    last_uploaded_mixed_ms: progress.last_uploaded_mixed_ms,
+                    updated_at: sent_at.clone(),
+                    ..existing
+                })?;
             self.publish_runtime_diagnostics_with_timestamp(
                 uplink_state.clone(),
                 progress.last_uploaded_mixed_ms,
@@ -423,40 +414,30 @@ where
     }
 
     fn persist_recording_state(&self, local_recording_state: &str) -> Result<(), String> {
-        self.database
-            .with_connection(|connection| {
-                let checkpoint =
-                    match CheckpointRepo::find_by_meeting_id(connection, &self.meeting_id)? {
-                        Some(existing) => SessionCheckpointRecord {
-                            local_recording_state: local_recording_state.to_string(),
-                            updated_at: current_timestamp_label(),
-                            ..existing
-                        },
-                        None => SessionCheckpointRecord {
-                            meeting_id: self.meeting_id.clone(),
-                            last_control_seq: 0,
-                            last_udp_seq_sent: 0,
-                            last_uploaded_mixed_ms: 0,
-                            last_transcript_segment_revision: 0,
-                            last_summary_version: 0,
-                            last_action_item_version: 0,
-                            local_recording_state: local_recording_state.to_string(),
-                            recovery_token: None,
-                            updated_at: current_timestamp_label(),
-                        },
-                    };
-
-                CheckpointRepo::upsert(connection, &checkpoint)
-            })
-            .map_err(|error| error.to_string())
+        let checkpoint = match self.persistence.find_checkpoint(&self.meeting_id)? {
+            Some(existing) => SessionCheckpointRecord {
+                local_recording_state: local_recording_state.to_string(),
+                updated_at: current_timestamp_label(),
+                ..existing
+            },
+            None => SessionCheckpointRecord {
+                meeting_id: self.meeting_id.clone(),
+                last_control_seq: 0,
+                last_udp_seq_sent: 0,
+                last_uploaded_mixed_ms: 0,
+                last_transcript_segment_revision: 0,
+                last_summary_version: 0,
+                last_action_item_version: 0,
+                local_recording_state: local_recording_state.to_string(),
+                recovery_token: None,
+                updated_at: current_timestamp_label(),
+            },
+        };
+        self.persistence.upsert_checkpoint(&checkpoint).map(|_| ())
     }
 
     fn load_checkpoint(&self) -> Result<Option<SessionCheckpointRecord>, String> {
-        self.database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, &self.meeting_id)
-            })
-            .map_err(|error| error.to_string())
+        self.persistence.find_checkpoint(&self.meeting_id)
     }
 
     fn publish_runtime_diagnostics(
@@ -566,7 +547,9 @@ where
         SourceInputDiagnostics {
             microphone_input_active: is_source_active(self.last_microphone_signal_at_ms, now_ms),
             system_input_active: is_source_active(self.last_system_signal_at_ms, now_ms),
-            last_microphone_input_at: self.last_microphone_input_at_ms.map(|value| value.to_string()),
+            last_microphone_input_at: self
+                .last_microphone_input_at_ms
+                .map(|value| value.to_string()),
             last_system_input_at: self.last_system_input_at_ms.map(|value| value.to_string()),
         }
     }
@@ -580,7 +563,9 @@ fn sequence_for_diagnostics(checkpoint: &SessionCheckpointRecord) -> Option<u64>
     }
 }
 
-fn diagnostics_uplink_state_from_checkpoint(checkpoint: &SessionCheckpointRecord) -> AudioUplinkState {
+fn diagnostics_uplink_state_from_checkpoint(
+    checkpoint: &SessionCheckpointRecord,
+) -> AudioUplinkState {
     match checkpoint.local_recording_state.as_str() {
         "prepared" => AudioUplinkState::Idle,
         "paused" => AudioUplinkState::Paused,
@@ -604,7 +589,9 @@ fn diagnostics_uplink_state_from_checkpoint(checkpoint: &SessionCheckpointRecord
 
 fn is_source_active(last_input_at_ms: Option<u64>, now_ms: u64) -> bool {
     last_input_at_ms
-        .map(|last_input_at_ms| now_ms.saturating_sub(last_input_at_ms) <= SOURCE_ACTIVITY_WINDOW_MS)
+        .map(|last_input_at_ms| {
+            now_ms.saturating_sub(last_input_at_ms) <= SOURCE_ACTIVITY_WINDOW_MS
+        })
         .unwrap_or(false)
 }
 
@@ -767,17 +754,16 @@ fn samples_for_duration_ms(duration_ms: u32, sample_rate_hz: u32, channels: u16)
 mod tests {
     use std::env;
     use std::fs;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::MeetingAudioRuntime;
     use crate::audio::coordinator::{AudioCoordinatorConfig, CaptureSourceKind};
     use crate::audio::writer::append_pcm16_wave;
+    use crate::backend_sync::{InMemoryMeetingSync, MeetingSync, SessionCheckpointRecord};
     use crate::events::bus::EventBus;
     use crate::events::types::RuntimeEvent;
     use crate::protocol::udp_packet::UdpAudioPacket;
-    use crate::storage::audio_repo::AudioRepo;
-    use crate::storage::checkpoint_repo::{CheckpointRepo, SessionCheckpointRecord};
-    use crate::storage::db::Database;
     use crate::transport::udp_audio::{InMemoryUdpSocket, UdpAudioTransport};
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -790,9 +776,9 @@ mod tests {
 
     #[test]
     fn prepare_persists_audio_asset_paths_and_checkpoint() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -802,16 +788,8 @@ mod tests {
 
         runtime.prepare().unwrap();
 
-        let assets = database
-            .with_connection(|connection| AudioRepo::find_by_meeting_id(connection, "meeting-1"))
-            .unwrap()
-            .unwrap();
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let assets = persistence.find_audio_assets("meeting-1").unwrap().unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert!(assets
             .mic_original_path
@@ -831,29 +809,24 @@ mod tests {
 
     #[test]
     fn prepare_preserves_existing_upload_checkpoint_progress() {
-        let database = Database::open_in_memory().unwrap();
-        database
-            .with_connection(|connection| {
-                CheckpointRepo::upsert(
-                    connection,
-                    &SessionCheckpointRecord {
-                        meeting_id: "meeting-1".to_string(),
-                        last_control_seq: 0,
-                        last_udp_seq_sent: 9,
-                        last_uploaded_mixed_ms: 2_000,
-                        last_transcript_segment_revision: 0,
-                        last_summary_version: 0,
-                        last_action_item_version: 0,
-                        local_recording_state: "error".to_string(),
-                        recovery_token: Some("recover-1".to_string()),
-                        updated_at: "1000".to_string(),
-                    },
-                )
+        let persistence = Arc::new(InMemoryMeetingSync::default());
+        persistence
+            .upsert_checkpoint(&SessionCheckpointRecord {
+                meeting_id: "meeting-1".to_string(),
+                last_control_seq: 0,
+                last_udp_seq_sent: 9,
+                last_uploaded_mixed_ms: 2_000,
+                last_transcript_segment_revision: 0,
+                last_summary_version: 0,
+                last_action_item_version: 0,
+                local_recording_state: "error".to_string(),
+                recovery_token: Some("recover-1".to_string()),
+                updated_at: "1000".to_string(),
             })
             .unwrap();
 
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -863,12 +836,7 @@ mod tests {
 
         runtime.prepare().unwrap();
 
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert_eq!(checkpoint.last_udp_seq_sent, 9);
         assert_eq!(checkpoint.last_uploaded_mixed_ms, 2_000);
@@ -878,9 +846,9 @@ mod tests {
 
     #[test]
     fn ingest_mixed_samples_updates_upload_checkpoint() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -894,12 +862,7 @@ mod tests {
             .ingest_mixed_samples(1_000, &vec![320; 6_400])
             .unwrap();
 
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert_eq!(checkpoint.last_udp_seq_sent, 1);
         assert_eq!(checkpoint.last_uploaded_mixed_ms, 1_400);
@@ -908,10 +871,10 @@ mod tests {
 
     #[test]
     fn audio_runtime_publishes_runtime_diagnostics_on_upload() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let event_bus = EventBus::default();
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence,
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -941,10 +904,10 @@ mod tests {
 
     #[test]
     fn source_input_diagnostics_mark_microphone_active_before_system_audio_arrives() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let event_bus = EventBus::default();
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence,
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -972,10 +935,10 @@ mod tests {
 
     #[test]
     fn source_input_diagnostics_keep_silent_system_frames_inactive() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let event_bus = EventBus::default();
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence,
             env::temp_dir(),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -1001,11 +964,11 @@ mod tests {
 
     #[test]
     fn push_source_samples_writes_source_and_mixed_wav_then_updates_checkpoint() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let temp_dir = unique_temp_dir("source-ingress");
         let socket = InMemoryUdpSocket::default();
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             temp_dir,
             UdpAudioTransport::new("meeting-1", socket.clone()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -1023,16 +986,8 @@ mod tests {
             .push_source_samples(CaptureSourceKind::SystemLoopback, 1_000, &vec![2000; 3_200])
             .unwrap();
 
-        let assets = database
-            .with_connection(|connection| AudioRepo::find_by_meeting_id(connection, "meeting-1"))
-            .unwrap()
-            .unwrap();
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let assets = persistence.find_audio_assets("meeting-1").unwrap().unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert!(mic_progress.is_empty());
         assert_eq!(mixed_progress.len(), 1);
@@ -1061,10 +1016,10 @@ mod tests {
 
     #[test]
     fn push_source_samples_aligns_to_later_stream_start_before_upload() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let temp_dir = unique_temp_dir("alignment");
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             temp_dir,
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -1085,12 +1040,7 @@ mod tests {
             .push_source_samples(CaptureSourceKind::Microphone, 1_200, &vec![1000; 1_600])
             .unwrap();
 
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert!(initial_progress.is_empty());
         assert_eq!(progress.len(), 1);
@@ -1100,11 +1050,11 @@ mod tests {
 
     #[test]
     fn single_source_passthrough_writes_microphone_and_mixed_wav_then_updates_checkpoint() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let temp_dir = unique_temp_dir("single-source");
         let socket = InMemoryUdpSocket::default();
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             temp_dir,
             UdpAudioTransport::new("meeting-1", socket.clone()),
             AudioCoordinatorConfig::single_source_passthrough(
@@ -1122,16 +1072,8 @@ mod tests {
             .push_source_samples(CaptureSourceKind::Microphone, 1_000, &vec![1200; 3_200])
             .unwrap();
 
-        let assets = database
-            .with_connection(|connection| AudioRepo::find_by_meeting_id(connection, "meeting-1"))
-            .unwrap()
-            .unwrap();
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let assets = persistence.find_audio_assets("meeting-1").unwrap().unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert_eq!(progress.len(), 1);
         assert_eq!(checkpoint.last_udp_seq_sent, 0);
@@ -1159,11 +1101,11 @@ mod tests {
 
     #[test]
     fn replay_pending_mixed_audio_replays_from_checkpoint_boundary() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let temp_dir = unique_temp_dir("replay");
         let socket = InMemoryUdpSocket::default();
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             temp_dir,
             UdpAudioTransport::new("meeting-1", socket.clone()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -1173,10 +1115,7 @@ mod tests {
 
         runtime.prepare().unwrap();
 
-        let assets = database
-            .with_connection(|connection| AudioRepo::find_by_meeting_id(connection, "meeting-1"))
-            .unwrap()
-            .unwrap();
+        let assets = persistence.find_audio_assets("meeting-1").unwrap().unwrap();
         append_pcm16_wave(
             std::path::Path::new(assets.mixed_uplink_path.as_deref().unwrap()),
             16_000,
@@ -1184,35 +1123,25 @@ mod tests {
             &vec![320; 6_400],
         )
         .unwrap();
-        database
-            .with_connection(|connection| {
-                CheckpointRepo::upsert(
-                    connection,
-                    &SessionCheckpointRecord {
-                        meeting_id: "meeting-1".to_string(),
-                        last_control_seq: 0,
-                        last_udp_seq_sent: 0,
-                        last_uploaded_mixed_ms: 200,
-                        last_transcript_segment_revision: 0,
-                        last_summary_version: 0,
-                        last_action_item_version: 0,
-                        local_recording_state: "recording".to_string(),
-                        recovery_token: Some("replay-1".to_string()),
-                        updated_at: "1000".to_string(),
-                    },
-                )
+        persistence
+            .upsert_checkpoint(&SessionCheckpointRecord {
+                meeting_id: "meeting-1".to_string(),
+                last_control_seq: 0,
+                last_udp_seq_sent: 0,
+                last_uploaded_mixed_ms: 200,
+                last_transcript_segment_revision: 0,
+                last_summary_version: 0,
+                last_action_item_version: 0,
+                local_recording_state: "recording".to_string(),
+                recovery_token: Some("replay-1".to_string()),
+                updated_at: "1000".to_string(),
             })
             .unwrap();
 
         runtime.start_capture().unwrap();
         let plan = runtime.replay_pending_mixed_audio().unwrap().unwrap();
         let packet = UdpAudioPacket::decode(&socket.take_last_packet().unwrap()).unwrap();
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert_eq!(plan.replay_from_ms, 200);
         assert_eq!(plan.replay_until_ms, 400);
@@ -1224,11 +1153,11 @@ mod tests {
 
     #[test]
     fn replay_pending_mixed_audio_keeps_future_live_chunk_sequence_continuous() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let temp_dir = unique_temp_dir("replay-sequence");
         let socket = InMemoryUdpSocket::default();
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             temp_dir,
             UdpAudioTransport::new("meeting-1", socket.clone()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -1238,10 +1167,7 @@ mod tests {
 
         runtime.prepare().unwrap();
 
-        let assets = database
-            .with_connection(|connection| AudioRepo::find_by_meeting_id(connection, "meeting-1"))
-            .unwrap()
-            .unwrap();
+        let assets = persistence.find_audio_assets("meeting-1").unwrap().unwrap();
         append_pcm16_wave(
             std::path::Path::new(assets.mixed_uplink_path.as_deref().unwrap()),
             16_000,
@@ -1249,23 +1175,18 @@ mod tests {
             &vec![320; 6_400],
         )
         .unwrap();
-        database
-            .with_connection(|connection| {
-                CheckpointRepo::upsert(
-                    connection,
-                    &SessionCheckpointRecord {
-                        meeting_id: "meeting-1".to_string(),
-                        last_control_seq: 0,
-                        last_udp_seq_sent: 0,
-                        last_uploaded_mixed_ms: 200,
-                        last_transcript_segment_revision: 0,
-                        last_summary_version: 0,
-                        last_action_item_version: 0,
-                        local_recording_state: "recording".to_string(),
-                        recovery_token: Some("replay-1".to_string()),
-                        updated_at: "1000".to_string(),
-                    },
-                )
+        persistence
+            .upsert_checkpoint(&SessionCheckpointRecord {
+                meeting_id: "meeting-1".to_string(),
+                last_control_seq: 0,
+                last_udp_seq_sent: 0,
+                last_uploaded_mixed_ms: 200,
+                last_transcript_segment_revision: 0,
+                last_summary_version: 0,
+                last_action_item_version: 0,
+                local_recording_state: "recording".to_string(),
+                recovery_token: Some("replay-1".to_string()),
+                updated_at: "1000".to_string(),
             })
             .unwrap();
 

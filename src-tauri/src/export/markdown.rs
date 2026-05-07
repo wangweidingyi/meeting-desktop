@@ -1,5 +1,4 @@
-use crate::storage::summary_repo::SummarySnapshotRecord;
-use crate::storage::transcript_repo::TranscriptSegmentRecord;
+use crate::backend_sync::{SummarySnapshotRecord, TranscriptSegmentRecord};
 
 #[derive(Debug, Clone)]
 pub struct MeetingMarkdownExport {
@@ -58,8 +57,7 @@ pub fn export_meeting_markdown(export: &MeetingMarkdownExport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{export_meeting_markdown, MeetingMarkdownExport};
-    use crate::storage::summary_repo::SummarySnapshotRecord;
-    use crate::storage::transcript_repo::TranscriptSegmentRecord;
+    use crate::backend_sync::{SummarySnapshotRecord, TranscriptSegmentRecord};
 
     #[test]
     fn markdown_export_contains_summary_transcript_and_action_items() {

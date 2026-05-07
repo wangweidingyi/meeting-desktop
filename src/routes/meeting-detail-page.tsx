@@ -75,7 +75,7 @@ export function MeetingDetailPage() {
               <p className="mt-2 text-sm text-slate-500">
                 {meeting
                   ? `${meeting.started_at}${meeting.ended_at ? ` - ${meeting.ended_at}` : " · 未结束"}`
-                  : "正在从本地 SQLite 读取会议详情"}
+                  : "正在从服务端加载会议详情"}
               </p>
             </div>
           </div>

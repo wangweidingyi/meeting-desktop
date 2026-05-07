@@ -87,9 +87,8 @@ mod tests {
     use crate::audio::coordinator::{AudioCoordinatorConfig, CaptureSourceKind};
     use crate::audio::platform::windows::{AudioDeviceDescriptor, CaptureStreamDescriptor};
     use crate::audio::runtime::MeetingAudioRuntime;
+    use crate::backend_sync::{InMemoryMeetingSync, MeetingSync};
     use crate::events::bus::EventBus;
-    use crate::storage::checkpoint_repo::CheckpointRepo;
-    use crate::storage::db::Database;
     use crate::transport::udp_audio::{InMemoryUdpSocket, UdpAudioTransport};
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -122,9 +121,9 @@ mod tests {
 
     #[test]
     fn runtime_sink_pushes_normalized_frames_into_meeting_runtime() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             unique_temp_dir("runtime"),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -163,12 +162,7 @@ mod tests {
         let source_samples = stereo_frame.repeat(9_600);
         sink(1_000, source_samples);
 
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert_eq!(checkpoint.last_uploaded_mixed_ms, 1_200);
         assert_eq!(checkpoint.last_udp_seq_sent, 0);

@@ -1,19 +1,13 @@
+use meeting_lib::backend_sync::{InMemoryMeetingSync, MeetingSync};
 use meeting_lib::session::manager::SessionManager;
 use meeting_lib::session::models::{SessionEvent, SessionStatus};
-use meeting_lib::storage::db::Database;
-use meeting_lib::storage::meetings_repo::MeetingsRepo;
-use meeting_lib::storage::summary_repo::SummaryRepo;
-use meeting_lib::storage::transcript_repo::TranscriptRepo;
 
 #[test]
-fn session_lifecycle_persists_completed_meeting_and_final_artifacts() {
-    let database = Database::open_in_memory().expect("open in memory database");
+fn session_lifecycle_builds_completed_meeting_and_persists_final_artifacts_in_memory_sync() {
+    let sync = InMemoryMeetingSync::default();
     let mut manager = SessionManager::default();
 
     let mut meeting = manager.create_meeting("桌面端 smoke".to_string());
-    database
-        .with_connection(|connection| MeetingsRepo::insert(connection, &meeting))
-        .expect("insert meeting");
 
     for event in [
         SessionEvent::ConnectRequested,
@@ -51,27 +45,17 @@ fn session_lifecycle_persists_completed_meeting_and_final_artifacts() {
         )
         .expect("build summary");
 
-    database
-        .with_connection(|connection| {
-            MeetingsRepo::upsert(connection, &meeting)?;
-            TranscriptRepo::upsert(connection, &transcript)?;
-            SummaryRepo::upsert_snapshot(connection, &summary)
-        })
-        .expect("persist final records");
+    sync.upsert_transcript_segment(&transcript)
+        .expect("persist transcript");
+    sync.upsert_summary_snapshot(&summary)
+        .expect("persist summary");
 
-    let persisted_meeting = database
-        .with_connection(|connection| MeetingsRepo::find_by_id(connection, &meeting.id))
-        .expect("query meeting")
-        .expect("meeting should exist");
-    let persisted_transcript = database
-        .with_connection(|connection| TranscriptRepo::list_by_meeting(connection, &meeting.id))
-        .expect("query transcript");
-    let persisted_summary = database
-        .with_connection(|connection| SummaryRepo::latest_snapshot(connection, &meeting.id))
-        .expect("query summary")
+    let persisted_transcript = sync.transcript_segments(&meeting.id);
+    let persisted_summary = sync
+        .latest_summary(&meeting.id)
         .expect("summary should exist");
 
-    assert_eq!(persisted_meeting.status, SessionStatus::Completed);
+    assert_eq!(meeting.status, SessionStatus::Completed);
     assert_eq!(persisted_transcript.len(), 1);
     assert!(persisted_transcript[0].is_final);
     assert!(persisted_summary.is_final);

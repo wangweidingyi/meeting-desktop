@@ -15,7 +15,6 @@ const commandMocks = vi.hoisted(() => ({
   pauseActiveMeetingMock: vi.fn(),
   resumeActiveMeetingMock: vi.fn(),
   stopActiveMeetingMock: vi.fn(),
-  syncMeetingToBackendMock: vi.fn(),
 }));
 
 const desktopEventMocks = vi.hoisted(() => ({
@@ -35,7 +34,6 @@ vi.mock("@/lib/api/commands", () => ({
   pauseActiveMeeting: commandMocks.pauseActiveMeetingMock,
   resumeActiveMeeting: commandMocks.resumeActiveMeetingMock,
   stopActiveMeeting: commandMocks.stopActiveMeetingMock,
-  syncMeetingToBackend: commandMocks.syncMeetingToBackendMock,
 }));
 
 vi.mock("@/lib/events/desktop-events", () => ({
@@ -68,7 +66,6 @@ describe("useLiveSession", () => {
     commandMocks.pauseActiveMeetingMock.mockReset();
     commandMocks.resumeActiveMeetingMock.mockReset();
     commandMocks.stopActiveMeetingMock.mockReset();
-    commandMocks.syncMeetingToBackendMock.mockReset();
     desktopEventMocks.listenSessionUpdatedMock.mockReset();
     desktopEventMocks.listenTranscriptDeltaMock.mockReset();
     desktopEventMocks.listenSummaryDeltaMock.mockReset();
@@ -92,7 +89,6 @@ describe("useLiveSession", () => {
       startupSttModel: "bigmodel",
       startupSttResourceId: "volc.seedasr.sauc.duration",
     });
-    commandMocks.syncMeetingToBackendMock.mockResolvedValue(undefined);
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -141,8 +137,6 @@ describe("useLiveSession", () => {
     expect(result.current.session.title).toBe("设计评审会");
     expect(result.current.session.status).toBe("recording");
     expect(result.current.session.connectionState).toBe("connected");
-    expect(commandMocks.syncMeetingToBackendMock).toHaveBeenNthCalledWith(1, makeMeetingRecord("idle"));
-    expect(commandMocks.syncMeetingToBackendMock).toHaveBeenNthCalledWith(2, makeMeetingRecord("recording"));
   });
 
   it("surfaces start failures into runtime diagnostics", async () => {
@@ -335,6 +329,38 @@ describe("useLiveSession", () => {
     expect(state.runtimeInfo.controlClientId).toBe("meeting-desktop");
     expect(state.runtimeInfo.mqttBrokerUrl).toBe("tcp://127.0.0.1:1883");
     expect(state.runtimeInfo.adminApiBaseUrl).toBe("http://127.0.0.1:8090");
+    expect(state.runtimeInfo.sttProvider).toBe("volcengine_streaming");
+    expect(state.runtimeInfo.sttModel).toBe("bigmodel");
+    expect(state.runtimeInfo.sttResourceId).toBe("volc.seedasr.sauc.duration");
+  });
+
+  it("skips admin settings fetch for member sessions and keeps startup stt config", async () => {
+    window.localStorage.setItem(
+      "meeting.desktop.auth",
+      JSON.stringify({
+        token: "member-token",
+        user: {
+          id: "user-1",
+          username: "oibp",
+          displayName: "oibp",
+          role: "member",
+          status: "active",
+        },
+      }),
+    );
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderHook(() => useLiveSession());
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const state = useSessionViewStore.getState();
     expect(state.runtimeInfo.sttProvider).toBe("volcengine_streaming");
     expect(state.runtimeInfo.sttModel).toBe("bigmodel");
     expect(state.runtimeInfo.sttResourceId).toBe("volc.seedasr.sauc.duration");

@@ -1,7 +1,6 @@
+use crate::backend_sync::{SummarySnapshotRecord, TranscriptSegmentRecord};
 use crate::session::models::{MeetingRecord, SessionEvent};
 use crate::session::state_machine::SessionStateMachine;
-use crate::storage::summary_repo::SummarySnapshotRecord;
-use crate::storage::transcript_repo::TranscriptSegmentRecord;
 use crate::transport::mqtt_control::MqttControlConfig;
 
 #[derive(Default)]

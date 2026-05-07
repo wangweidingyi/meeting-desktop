@@ -33,6 +33,14 @@ type RuntimeBackendInfo = {
 
 const storageKey = "meeting.desktop.auth";
 
+async function invokeAuthSync(command: string, payload?: Record<string, unknown>) {
+  try {
+    await invoke(command, payload);
+  } catch {
+    // Ignore runtime sync failures in browser-based tests or when Tauri is not ready yet.
+  }
+}
+
 export function getDesktopAuthSession(): DesktopAuthSession | null {
   const raw = window.localStorage.getItem(storageKey);
   if (!raw) {
@@ -92,6 +100,7 @@ export async function loginDesktop(username: string, password: string): Promise<
     },
   };
   setDesktopAuthSession(session);
+  await syncDesktopAuthTokenToRuntime(session.token);
   return session;
 }
 
@@ -106,5 +115,14 @@ export async function logoutDesktop() {
       },
     });
   }
+  await clearDesktopBackendAuthToken();
   clearDesktopAuthSession();
+}
+
+export async function syncDesktopAuthTokenToRuntime(token: string) {
+  await invokeAuthSync("set_backend_auth_token", { token });
+}
+
+export async function clearDesktopBackendAuthToken() {
+  await invokeAuthSync("clear_backend_auth_token");
 }

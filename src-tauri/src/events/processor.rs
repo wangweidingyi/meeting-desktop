@@ -1,9 +1,9 @@
 use tauri::{AppHandle, Emitter};
 
+use crate::backend_sync::{
+    ActionItemsRecord, MeetingSync, SummarySnapshotRecord, TranscriptSegmentRecord,
+};
 use crate::events::types::RuntimeEvent;
-use crate::storage::db::Database;
-use crate::storage::summary_repo::{SummaryRepo, SummarySnapshotRecord};
-use crate::storage::transcript_repo::{TranscriptRepo, TranscriptSegmentRecord};
 
 pub const DESKTOP_EVENT_SESSION_UPDATED: &str = "meeting://session-updated";
 pub const DESKTOP_EVENT_TRANSCRIPT_DELTA: &str = "meeting://transcript-delta";
@@ -13,75 +13,40 @@ pub const DESKTOP_EVENT_TRANSPORT_STATE: &str = "meeting://transport-state";
 pub const DESKTOP_EVENT_TRANSPORT_ERROR: &str = "meeting://transport-error";
 pub const DESKTOP_EVENT_RUNTIME_DIAGNOSTICS: &str = "meeting://runtime-diagnostics";
 
-pub fn process_runtime_event(database: &Database, event: &RuntimeEvent) -> Result<(), String> {
+pub fn process_runtime_event(sync: &dyn MeetingSync, event: &RuntimeEvent) -> Result<(), String> {
     match event {
-        RuntimeEvent::TranscriptDelta(payload) => database
-            .with_connection(|connection| {
-                TranscriptRepo::upsert(
-                    connection,
-                    &TranscriptSegmentRecord {
-                        segment_id: payload.segment_id.clone(),
-                        meeting_id: payload.session_id.clone(),
-                        start_ms: payload.start_ms,
-                        end_ms: payload.end_ms,
-                        text: payload.text.clone(),
-                        is_final: payload.is_final,
-                        speaker_id: payload.speaker_id.clone(),
-                        revision: payload.revision,
-                    },
-                )
+        RuntimeEvent::TranscriptDelta(payload) => {
+            sync.upsert_transcript_segment(&TranscriptSegmentRecord {
+                segment_id: payload.segment_id.clone(),
+                meeting_id: payload.session_id.clone(),
+                start_ms: payload.start_ms,
+                end_ms: payload.end_ms,
+                text: payload.text.clone(),
+                is_final: payload.is_final,
+                speaker_id: payload.speaker_id.clone(),
+                revision: payload.revision,
             })
-            .map_err(|error| error.to_string()),
-        RuntimeEvent::SummaryDelta(payload) => database
-            .with_connection(|connection| {
-                SummaryRepo::upsert_snapshot(
-                    connection,
-                    &SummarySnapshotRecord {
-                        meeting_id: payload.session_id.clone(),
-                        version: payload.version,
-                        updated_at: payload.updated_at.clone(),
-                        abstract_text: payload.abstract_text.clone(),
-                        key_points: payload.key_points.clone(),
-                        decisions: payload.decisions.clone(),
-                        risks: payload.risks.clone(),
-                        action_items: payload.action_items.clone(),
-                        is_final: payload.is_final,
-                    },
-                )
+        }
+        RuntimeEvent::SummaryDelta(payload) => {
+            sync.upsert_summary_snapshot(&SummarySnapshotRecord {
+                meeting_id: payload.session_id.clone(),
+                version: payload.version,
+                updated_at: payload.updated_at.clone(),
+                abstract_text: payload.abstract_text.clone(),
+                key_points: payload.key_points.clone(),
+                decisions: payload.decisions.clone(),
+                risks: payload.risks.clone(),
+                action_items: payload.action_items.clone(),
+                is_final: payload.is_final,
             })
-            .map_err(|error| error.to_string()),
-        RuntimeEvent::ActionItemsDelta(payload) => database
-            .with_connection(|connection| {
-                let existing = SummaryRepo::latest_snapshot(connection, &payload.session_id)?;
-                let snapshot = if let Some(existing) = existing {
-                    SummarySnapshotRecord {
-                        meeting_id: existing.meeting_id,
-                        version: payload.version.max(existing.version),
-                        updated_at: payload.updated_at.clone(),
-                        abstract_text: existing.abstract_text,
-                        key_points: existing.key_points,
-                        decisions: existing.decisions,
-                        risks: existing.risks,
-                        action_items: payload.items.clone(),
-                        is_final: payload.is_final || existing.is_final,
-                    }
-                } else {
-                    SummarySnapshotRecord {
-                        meeting_id: payload.session_id.clone(),
-                        version: payload.version,
-                        updated_at: payload.updated_at.clone(),
-                        abstract_text: String::new(),
-                        key_points: vec![],
-                        decisions: vec![],
-                        risks: vec![],
-                        action_items: payload.items.clone(),
-                        is_final: payload.is_final,
-                    }
-                };
-
-                SummaryRepo::upsert_snapshot(connection, &snapshot)
-            })
-            .map_err(|error| error.to_string()),
+        }
+        RuntimeEvent::ActionItemsDelta(payload) => sync.apply_action_items(&ActionItemsRecord {
+            meeting_id: payload.session_id.clone(),
+            version: payload.version,
+            updated_at: payload.updated_at.clone(),
+            items: payload.items.clone(),
+            is_final: payload.is_final,
+        }),
         _ => Ok(()),
     }
 }
@@ -115,21 +80,19 @@ pub fn emit_runtime_event(app_handle: &AppHandle, event: &RuntimeEvent) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use crate::backend_sync::InMemoryMeetingSync;
     use crate::events::types::{
         ActionItemsDeltaPayload, RuntimeEvent, SummaryDeltaPayload, TranscriptDeltaPayload,
     };
-    use crate::storage::db::Database;
-    use crate::storage::summary_repo::SummaryRepo;
-    use crate::storage::transcript_repo::TranscriptRepo;
 
     use super::process_runtime_event;
 
     #[test]
     fn process_runtime_event_persists_transcript_and_summary_payloads() {
-        let database = Database::open_in_memory().unwrap();
+        let sync = InMemoryMeetingSync::default();
 
         process_runtime_event(
-            &database,
+            &sync,
             &RuntimeEvent::TranscriptDelta(TranscriptDeltaPayload {
                 session_id: "meeting-1".to_string(),
                 segment_id: "segment-1".to_string(),
@@ -144,7 +107,7 @@ mod tests {
         .unwrap();
 
         process_runtime_event(
-            &database,
+            &sync,
             &RuntimeEvent::SummaryDelta(SummaryDeltaPayload {
                 session_id: "meeting-1".to_string(),
                 version: 2,
@@ -159,16 +122,8 @@ mod tests {
         )
         .unwrap();
 
-        let transcript = database
-            .with_connection(|connection| {
-                TranscriptRepo::find_by_segment_id(connection, "segment-1")
-            })
-            .unwrap()
-            .unwrap();
-        let summary = database
-            .with_connection(|connection| SummaryRepo::latest_snapshot(connection, "meeting-1"))
-            .unwrap()
-            .unwrap();
+        let transcript = sync.transcript_segments("meeting-1").pop().unwrap();
+        let summary = sync.latest_summary("meeting-1").unwrap();
 
         assert_eq!(transcript.text, "先落一条实时转写");
         assert_eq!(summary.version, 2);
@@ -177,10 +132,10 @@ mod tests {
 
     #[test]
     fn process_runtime_event_merges_action_items_delta_into_latest_summary() {
-        let database = Database::open_in_memory().unwrap();
+        let sync = InMemoryMeetingSync::default();
 
         process_runtime_event(
-            &database,
+            &sync,
             &RuntimeEvent::SummaryDelta(SummaryDeltaPayload {
                 session_id: "meeting-2".to_string(),
                 version: 1,
@@ -196,7 +151,7 @@ mod tests {
         .unwrap();
 
         process_runtime_event(
-            &database,
+            &sync,
             &RuntimeEvent::ActionItemsDelta(ActionItemsDeltaPayload {
                 session_id: "meeting-2".to_string(),
                 version: 2,
@@ -207,10 +162,7 @@ mod tests {
         )
         .unwrap();
 
-        let summary = database
-            .with_connection(|connection| SummaryRepo::latest_snapshot(connection, "meeting-2"))
-            .unwrap()
-            .unwrap();
+        let summary = sync.latest_summary("meeting-2").unwrap();
 
         assert_eq!(summary.abstract_text, "先有纪要主体");
         assert_eq!(

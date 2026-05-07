@@ -432,9 +432,8 @@ impl MqttControlTransport {
                         if let Err(error) =
                             repair_active_session(&config, broker_client, &state, true)
                         {
-                            let _ = event_bus.publish(RuntimeEvent::TransportError {
-                                message: error,
-                            });
+                            let _ =
+                                event_bus.publish(RuntimeEvent::TransportError { message: error });
                         }
                     }
                 }
@@ -1133,13 +1132,11 @@ mod tests {
         assert!(transport.queued_messages().unwrap().is_empty());
         assert_eq!(
             events,
-            vec![
-                RuntimeEvent::TransportStateChanged(TransportStatePayload {
-                    session_id: "session-1".to_string(),
-                    state: TransportConnectionState::Connecting,
-                    message: None,
-                }),
-            ]
+            vec![RuntimeEvent::TransportStateChanged(TransportStatePayload {
+                session_id: "session-1".to_string(),
+                state: TransportConnectionState::Connecting,
+                message: None,
+            }),]
         );
     }
 

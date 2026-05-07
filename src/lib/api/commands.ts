@@ -33,6 +33,10 @@ type RawMeetingDetail = {
   action_items: string[];
 };
 
+type MeetingListResponse = {
+  items: DesktopMeetingRecord[];
+};
+
 export type RuntimeBackendInfo = {
   controlClientId: string;
   currentUserId: string | null;
@@ -43,10 +47,6 @@ export type RuntimeBackendInfo = {
   startupSttProvider: string | null;
   startupSttModel: string | null;
   startupSttResourceId: string | null;
-};
-
-type SyncedMeetingRecord = DesktopMeetingRecord & {
-  client_id: string;
 };
 
 function formatDuration(durationMs: number) {
@@ -68,6 +68,74 @@ function mapTranscriptSegment(segment: RawTranscriptSegment): TranscriptSegmentV
     speakerId: segment.speaker_id,
     revision: segment.revision,
   };
+}
+
+async function getAuthenticatedRuntime() {
+  const runtime = await getRuntimeBackendInfo();
+  if (!runtime.adminApiBaseUrl) {
+    throw new Error("未配置管理后台地址");
+  }
+
+  const session = getDesktopAuthSession();
+  if (!session?.token) {
+    throw new Error("当前未登录桌面端");
+  }
+
+  return {
+    runtime,
+    token: session.token,
+  };
+}
+
+async function fetchAppJSON<T>(path: string, init?: RequestInit): Promise<T> {
+  const { runtime, token } = await getAuthenticatedRuntime();
+  const response = await fetch(`${runtime.adminApiBaseUrl}${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(body || `backend request failed with status ${response.status}`);
+  }
+
+  return (await response.json()) as T;
+}
+
+function exportMeetingMarkdown(detail: RawMeetingDetail) {
+  const lines = [
+    `# ${detail.meeting.title}`,
+    "",
+    `开始时间：${detail.meeting.started_at}`,
+    `结束时间：${detail.meeting.ended_at ?? "未结束"}`,
+    "",
+  ];
+
+  if (detail.summary) {
+    lines.push("## 最终会议纪要", "");
+    lines.push(detail.summary.abstract_text, "");
+    lines.push("### 关键要点");
+    lines.push(...detail.summary.key_points.map((item) => `- ${item}`));
+    lines.push("", "### 决策");
+    lines.push(...detail.summary.decisions.map((item) => `- ${item}`));
+    lines.push("", "### 风险");
+    lines.push(...detail.summary.risks.map((item) => `- ${item}`));
+    lines.push("", "## 行动项");
+    lines.push(...detail.summary.action_items.map((item) => `- ${item}`));
+    lines.push("");
+  }
+
+  lines.push("## 完整逐段转写", "");
+  lines.push(
+    ...detail.transcript_segments.map((segment) => `- [${segment.start_ms} - ${segment.end_ms}] ${segment.text}`),
+  );
+  lines.push("");
+
+  return lines.join("\n");
 }
 
 function mapSummary(summary: RawSummarySnapshot): SummaryViewState {
@@ -104,36 +172,9 @@ export async function getRuntimeBackendInfo() {
   return invoke<RuntimeBackendInfo>("get_runtime_backend_info");
 }
 
-export async function syncMeetingToBackend(meeting: DesktopMeetingRecord) {
-  const runtime = await getRuntimeBackendInfo();
-  if (!runtime.adminApiBaseUrl) {
-    return;
-  }
-  const session = getDesktopAuthSession();
-  if (!session?.token) {
-    return;
-  }
-
-  const response = await fetch(`${runtime.adminApiBaseUrl}/api/app/meetings/${meeting.id}`, {
-    method: "PUT",
-    headers: {
-      Authorization: `Bearer ${session.token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      ...meeting,
-      client_id: runtime.controlClientId,
-    } satisfies SyncedMeetingRecord),
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(body || `backend meeting sync failed with status ${response.status}`);
-  }
-}
-
 export async function listRecoverableMeetings() {
-  return invoke<DesktopMeetingRecord[]>("list_recoverable_meetings");
+  const response = await fetchAppJSON<MeetingListResponse>("/api/app/meetings/recoverable");
+  return response.items;
 }
 
 export async function startActiveMeeting() {
@@ -141,7 +182,8 @@ export async function startActiveMeeting() {
 }
 
 export async function resumeRecoverableMeeting(meetingId: string) {
-  return invoke<DesktopMeetingRecord>("resume_recoverable_meeting", { meetingId });
+  const detail = await fetchAppJSON<RawMeetingDetail>(`/api/app/meetings/${meetingId}`);
+  return invoke<DesktopMeetingRecord>("resume_recoverable_meeting", { meeting: detail.meeting });
 }
 
 export async function pauseActiveMeeting() {
@@ -157,7 +199,8 @@ export async function stopActiveMeeting() {
 }
 
 export async function listMeetingHistory() {
-  const meetings = await invoke<DesktopMeetingRecord[]>("list_meeting_history");
+  const response = await fetchAppJSON<MeetingListResponse>("/api/app/meetings");
+  const meetings = response.items;
 
   return meetings.map<MeetingListItem>((meeting) => ({
     id: meeting.id,
@@ -171,11 +214,12 @@ export async function listMeetingHistory() {
 }
 
 export async function exportMarkdown(meetingId: string) {
-  return invoke<string>("export_markdown", { meetingId });
+  const detail = await fetchAppJSON<RawMeetingDetail>(`/api/app/meetings/${meetingId}`);
+  return exportMeetingMarkdown(detail);
 }
 
 export async function getMeetingDetail(meetingId: string): Promise<MeetingDetailView> {
-  const detail = await invoke<RawMeetingDetail>("get_meeting_detail", { meetingId });
+  const detail = await fetchAppJSON<RawMeetingDetail>(`/api/app/meetings/${meetingId}`);
 
   return {
     meeting: detail.meeting,

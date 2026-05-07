@@ -21,7 +21,6 @@ import {
   getMeetingDetail,
   listRecoverableMeetings,
   resumeRecoverableMeeting,
-  syncMeetingToBackend,
 } from "@/lib/api/commands";
 import { cn } from "@/lib/utils";
 import { useSessionViewStore } from "@/lib/state/session-view-store";
@@ -72,7 +71,6 @@ export function HomePage() {
     const store = useSessionViewStore.getState();
 
     store.syncFromMeetingRecord(meeting);
-    await syncMeetingToBackend(meeting);
 
     try {
       const detail = await getMeetingDetail(recoverableMeeting.id);
@@ -283,7 +281,7 @@ export function HomePage() {
           {isLoading ? (
             <Card className="border border-dashed border-black/10 bg-slate-50/80">
               <CardContent className="py-8 text-sm text-slate-500">
-                正在从本地 SQLite 加载会议历史...
+                正在从服务端加载会议历史...
               </CardContent>
             </Card>
           ) : null}

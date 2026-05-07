@@ -596,9 +596,9 @@ mod tests {
 
     use super::{
         build_callback_state_for_test, convert_f32_interleaved_to_pcm16_mono,
-        format_start_error,
-        enqueue_system_audio_samples_for_state_test, invoke_system_audio_callback_for_test,
-        MacosSystemAudioDescriptor, MacosSystemCaptureRuntime, StreamPcmConverter,
+        enqueue_system_audio_samples_for_state_test, format_start_error,
+        invoke_system_audio_callback_for_test, MacosSystemAudioDescriptor,
+        MacosSystemCaptureRuntime, StreamPcmConverter,
     };
     use crate::audio::platform::macos::PcmFrameCallback;
 
@@ -769,8 +769,9 @@ mod tests {
 
     #[test]
     fn format_start_error_explains_unsupported_os() {
-        let error =
-            format_start_error("macOS system audio capture requires ScreenCaptureKit audio capture");
+        let error = format_start_error(
+            "macOS system audio capture requires ScreenCaptureKit audio capture",
+        );
 
         assert_eq!(
             error,
@@ -780,8 +781,7 @@ mod tests {
 
     #[test]
     fn format_start_error_explains_permission_denied() {
-        let error =
-            format_start_error("AudioDeviceStart failed with OSStatus -54 ('perm')");
+        let error = format_start_error("AudioDeviceStart failed with OSStatus -54 ('perm')");
 
         assert_eq!(
             error,

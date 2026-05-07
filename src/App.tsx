@@ -1,12 +1,14 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AudioLines, LayoutDashboard, ScrollText } from "lucide-react";
 import { BrowserRouter, NavLink, Navigate, Route, Routes } from "react-router-dom";
 
 import {
   clearDesktopAuthSession,
+  clearDesktopBackendAuthToken,
   getDesktopAuthSession,
   loginDesktop,
   logoutDesktop,
+  syncDesktopAuthTokenToRuntime,
   type DesktopAuthSession,
 } from "@/lib/auth";
 import { HomePage } from "@/routes/home-page";
@@ -34,6 +36,15 @@ const navigationItems = [
 
 function App() {
   const [session, setSession] = useState(() => getDesktopAuthSession());
+
+  useEffect(() => {
+    if (!session?.token) {
+      void clearDesktopBackendAuthToken();
+      return;
+    }
+
+    void syncDesktopAuthTokenToRuntime(session.token);
+  }, [session]);
 
   if (!session) {
     return <DesktopLoginPage onSuccess={setSession} />;

@@ -5,7 +5,7 @@ Tauri v2 desktop client for the meeting assistant. Rust owns session lifecycle, 
 ## Current milestone
 
 - Meeting home, live session, and meeting detail pages are in place.
-- SQLite persists meeting history, transcript segments, summary snapshots, action items, and recovery checkpoints.
+- Backend persistence stores meeting history, transcript segments, summary snapshots, action items, audio asset metadata, and recovery checkpoints.
 - The desktop runtime now prepares a per-session transport bundle:
   - real MQTT control runtime when a broker is configured
   - in-memory MQTT-compatible stub when no broker is configured
@@ -15,7 +15,7 @@ Tauri v2 desktop client for the meeting assistant. Rust owns session lifecycle, 
 ## What is real vs. staged today
 
 - Real today:
-  - local SQLite persistence
+  - backend-only business persistence
   - Rust session state transitions
   - broker-backed MQTT control transport
   - transport-state and transport-error desktop events for connect / reconnect / disconnect UI feedback
@@ -29,7 +29,7 @@ Tauri v2 desktop client for the meeting assistant. Rust owns session lifecycle, 
   - macOS can optionally mirror microphone frames into the persisted `system-original.wav` track and dual-source mixed uplink path when `MEETING_MACOS_DEV_SYSTEM_AUDIO=mirror_microphone` is enabled for local pipeline verification
   - macOS ScreenCaptureKit system audio capture bridge for real system output capture
   - UDP audio transport socket setup and packet encoding
-  - runtime event processing into SQLite and Tauri frontend events
+  - runtime event processing into backend APIs and Tauri frontend events
   - backend Go runtime with live UDP listener
 - Still staged for the next desktop batch:
   - Windows-target compile and manual device verification on an actual Windows environment

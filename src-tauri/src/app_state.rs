@@ -6,14 +6,14 @@ use tauri::{AppHandle, Manager};
 
 use crate::audio::platform::PlatformCaptureRuntime;
 use crate::audio::runtime::MeetingAudioRuntime;
+use crate::backend_sync::{HttpMeetingSync, SharedMeetingSync};
 use crate::config::BackendRuntimeConfig;
 use crate::events::bus::EventBus;
 use crate::session::manager::SessionManager;
-use crate::storage::db::Database;
 use crate::transport::runtime::{AudioTransportRuntime, SessionTransportRuntime};
 
 pub struct AppState {
-    pub database: Database,
+    pub backend_sync: SharedMeetingSync,
     pub events: EventBus,
     pub runtime_config: BackendRuntimeConfig,
     pub audio_root_dir: PathBuf,
@@ -34,12 +34,12 @@ impl AppState {
         let audio_root_dir = app_data_dir.join("audio");
         fs::create_dir_all(&audio_root_dir).map_err(|error| error.to_string())?;
 
-        let db_path = app_data_dir.join("meeting.sqlite3");
-        let database = Database::open(&db_path).map_err(|error| error.to_string())?;
         let runtime_config = BackendRuntimeConfig::from_env()?;
+        let backend_sync: SharedMeetingSync =
+            Arc::new(HttpMeetingSync::new(runtime_config.admin_api_base_url())?);
 
         Ok(Self {
-            database,
+            backend_sync,
             events: EventBus::default(),
             runtime_config,
             audio_root_dir,

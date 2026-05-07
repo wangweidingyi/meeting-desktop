@@ -5,10 +5,10 @@ use crate::app_state::AppState;
 use crate::audio::coordinator::{AudioCoordinatorConfig, CaptureSourceKind};
 use crate::audio::platform::PlatformCaptureRuntime;
 use crate::audio::runtime::MeetingAudioRuntime;
+use crate::backend_sync::{MeetingSync, SyncedMeetingRecord};
 use crate::config::{BackendRuntimeConfig, MacosSystemAudioMode};
 use crate::events::types::{AudioUplinkState, RuntimeEvent, SessionSnapshot};
 use crate::session::models::{MeetingRecord, SessionEvent};
-use crate::storage::meetings_repo::MeetingsRepo;
 use crate::transport::control_transport::ControlTransport;
 use crate::transport::runtime::SessionTransportFactory;
 
@@ -54,12 +54,8 @@ pub fn create_meeting(state: State<'_, AppState>, title: String) -> Result<Meeti
         meeting
     };
 
+    persist_meeting_record_to_backend(state.backend_sync.as_ref(), &state.runtime_config, &meeting)?;
     prepare_runtime_for_meeting(&state, &meeting.id)?;
-
-    state
-        .database
-        .with_connection(|connection| MeetingsRepo::insert(connection, &meeting))
-        .map_err(|error| error.to_string())?;
 
     publish_session_snapshot(&state, Some(meeting.clone()))?;
 
@@ -83,10 +79,16 @@ pub fn get_runtime_backend_info(state: State<'_, AppState>) -> Result<RuntimeBac
 
 #[tauri::command]
 pub fn list_recoverable_meetings(state: State<'_, AppState>) -> Result<Vec<MeetingRecord>, String> {
-    state
-        .database
-        .with_connection(MeetingsRepo::list_recoverable)
-        .map_err(|error| error.to_string())
+    let manager = state
+        .session_manager
+        .lock()
+        .map_err(|error| error.to_string())?;
+    Ok(manager
+        .active_meeting()
+        .filter(|meeting| meeting.status.is_recoverable())
+        .cloned()
+        .into_iter()
+        .collect())
 }
 
 #[tauri::command]
@@ -97,14 +99,8 @@ pub fn start_active_meeting(state: State<'_, AppState>) -> Result<MeetingRecord,
 #[tauri::command]
 pub fn resume_recoverable_meeting(
     state: State<'_, AppState>,
-    meeting_id: String,
+    meeting: MeetingRecord,
 ) -> Result<MeetingRecord, String> {
-    let meeting = state
-        .database
-        .with_connection(|connection| MeetingsRepo::find_by_id(connection, &meeting_id))
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "recoverable meeting was not found".to_string())?;
-
     if !meeting.status.is_recoverable() {
         return Err("meeting is not recoverable".to_string());
     }
@@ -121,6 +117,18 @@ pub fn resume_recoverable_meeting(
 
     prepare_runtime_for_meeting(&state, &meeting.id)?;
     start_current_active_meeting(&state)
+}
+
+#[tauri::command]
+pub fn set_backend_auth_token(state: State<'_, AppState>, token: String) -> Result<(), String> {
+    state.backend_sync.set_auth_token(Some(token));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_backend_auth_token(state: State<'_, AppState>) -> Result<(), String> {
+    state.backend_sync.set_auth_token(None);
+    Ok(())
 }
 
 fn start_current_active_meeting(state: &State<'_, AppState>) -> Result<MeetingRecord, String> {
@@ -270,7 +278,7 @@ fn prepare_runtime_for_meeting(
     let transport =
         SessionTransportFactory::prepare(&state.runtime_config, meeting_id, state.events.clone())?;
     let mut audio_runtime = MeetingAudioRuntime::new(
-        state.database.clone(),
+        state.backend_sync.clone(),
         state.audio_root_dir.clone(),
         transport.audio_transport().clone(),
         build_audio_coordinator_config(&state.runtime_config, meeting_id),
@@ -325,9 +333,7 @@ fn clear_runtime_handles(state: &State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-fn build_runtime_diagnostics_capture_mode(
-    runtime_config: &BackendRuntimeConfig,
-) -> Option<String> {
+fn build_runtime_diagnostics_capture_mode(runtime_config: &BackendRuntimeConfig) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         Some(
@@ -750,6 +756,22 @@ fn publish_audio_uplink_state(
     Ok(())
 }
 
+fn persist_meeting_record_to_backend(
+    sync: &dyn MeetingSync,
+    runtime_config: &BackendRuntimeConfig,
+    meeting: &MeetingRecord,
+) -> Result<(), String> {
+    sync.upsert_meeting(&SyncedMeetingRecord {
+        id: meeting.id.clone(),
+        client_id: runtime_config.client_id.clone(),
+        title: meeting.title.clone(),
+        status: meeting.status.as_db_value().to_string(),
+        started_at: meeting.started_at.clone(),
+        ended_at: meeting.ended_at.clone(),
+        duration_ms: meeting.duration_ms,
+    })
+}
+
 fn mutate_active_meeting(
     state: &State<'_, AppState>,
     events: &[SessionEvent],
@@ -769,11 +791,11 @@ fn mutate_active_meeting(
         latest_meeting.ok_or_else(|| "no session event supplied".to_string())?
     };
 
-    state
-        .database
-        .with_connection(|connection| MeetingsRepo::upsert(connection, &updated_meeting))
-        .map_err(|error| error.to_string())?;
-
+    persist_meeting_record_to_backend(
+        state.backend_sync.as_ref(),
+        &state.runtime_config,
+        &updated_meeting,
+    )?;
     publish_session_snapshot(&state, Some(updated_meeting.clone()))?;
 
     Ok(updated_meeting)
@@ -804,6 +826,7 @@ mod tests {
     use super::{
         build_audio_coordinator_config, build_macos_capture_startup_plan,
         build_macos_source_runtime_sink, build_platform_capture_failure_cleanup_plan,
+        persist_meeting_record_to_backend,
         combine_cleanup_results, ControlFailureCleanup, MacosMicrophoneSinkMode,
         PlatformCaptureFailureContext,
     };
@@ -811,11 +834,13 @@ mod tests {
         AudioCoordinatorConfig, AudioUplinkStrategy, CaptureSourceKind,
     };
     use crate::audio::runtime::MeetingAudioRuntime;
+    use crate::backend_sync::{
+        AudioAssetRecord, InMemoryMeetingSync, MeetingSync, SessionCheckpointRecord,
+    };
     use crate::config::{BackendRuntimeConfig, MacosSystemAudioMode};
     use crate::events::bus::EventBus;
     use crate::events::types::AudioUplinkState;
-    use crate::storage::checkpoint_repo::CheckpointRepo;
-    use crate::storage::db::Database;
+    use crate::session::models::MeetingRecord;
     use crate::transport::udp_audio::{InMemoryUdpSocket, UdpAudioTransport};
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -826,11 +851,126 @@ mod tests {
         std::env::temp_dir().join(format!("meeting-macos-runtime-sink-{label}-{nanos}"))
     }
 
+    #[derive(Default)]
+    struct StrictMeetingSync {
+        operations: Mutex<Vec<String>>,
+        meeting_ids: Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl StrictMeetingSync {
+        fn operations(&self) -> Vec<String> {
+            self.operations.lock().unwrap().clone()
+        }
+    }
+
+    impl MeetingSync for StrictMeetingSync {
+        fn set_auth_token(&self, _token: Option<String>) {}
+
+        fn upsert_meeting(
+            &self,
+            meeting: &crate::backend_sync::SyncedMeetingRecord,
+        ) -> Result<(), String> {
+            self.meeting_ids.lock().unwrap().insert(meeting.id.clone());
+            self.operations.lock().unwrap().push("meeting".to_string());
+            Ok(())
+        }
+
+        fn upsert_transcript_segment(
+            &self,
+            _segment: &crate::backend_sync::TranscriptSegmentRecord,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn upsert_summary_snapshot(
+            &self,
+            _summary: &crate::backend_sync::SummarySnapshotRecord,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn apply_action_items(
+            &self,
+            _action_items: &crate::backend_sync::ActionItemsRecord,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn upsert_checkpoint(
+            &self,
+            checkpoint: &SessionCheckpointRecord,
+        ) -> Result<SessionCheckpointRecord, String> {
+            if !self
+                .meeting_ids
+                .lock()
+                .unwrap()
+                .contains(&checkpoint.meeting_id)
+            {
+                return Err("meeting not found".to_string());
+            }
+            self.operations
+                .lock()
+                .unwrap()
+                .push("checkpoint".to_string());
+            Ok(checkpoint.clone())
+        }
+
+        fn find_checkpoint(
+            &self,
+            _meeting_id: &str,
+        ) -> Result<Option<SessionCheckpointRecord>, String> {
+            Ok(None)
+        }
+
+        fn upsert_audio_assets(&self, assets: &AudioAssetRecord) -> Result<(), String> {
+            if !self.meeting_ids.lock().unwrap().contains(&assets.meeting_id) {
+                return Err("meeting not found".to_string());
+            }
+            self.operations
+                .lock()
+                .unwrap()
+                .push("audio-assets".to_string());
+            Ok(())
+        }
+
+        fn find_audio_assets(&self, _meeting_id: &str) -> Result<Option<AudioAssetRecord>, String> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn persisting_meeting_before_runtime_prepare_allows_dependent_backend_sync() {
+        let persistence = Arc::new(StrictMeetingSync::default());
+        let runtime_config = BackendRuntimeConfig::default();
+        let meeting = MeetingRecord::new("顺序校验".to_string());
+
+        persist_meeting_record_to_backend(persistence.as_ref(), &runtime_config, &meeting).unwrap();
+
+        let mut runtime = MeetingAudioRuntime::new(
+            persistence.clone(),
+            unique_temp_dir("persist-order"),
+            UdpAudioTransport::new(&meeting.id, InMemoryUdpSocket::default()),
+            AudioCoordinatorConfig::new(meeting.id.clone()),
+            EventBus::default(),
+            "127.0.0.1:6000".to_string(),
+        );
+        runtime.prepare().unwrap();
+
+        assert_eq!(
+            persistence.operations(),
+            vec![
+                "meeting".to_string(),
+                "audio-assets".to_string(),
+                "checkpoint".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn macos_source_runtime_sink_pushes_system_loopback_samples() {
-        let database = Database::open_in_memory().unwrap();
+        let persistence = Arc::new(InMemoryMeetingSync::default());
         let mut runtime = MeetingAudioRuntime::new(
-            database.clone(),
+            persistence.clone(),
             unique_temp_dir("source"),
             UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
             AudioCoordinatorConfig::new("meeting-1"),
@@ -854,12 +994,7 @@ mod tests {
 
         sink(1_000, vec![2000; 3_200]);
 
-        let checkpoint = database
-            .with_connection(|connection| {
-                CheckpointRepo::find_by_meeting_id(connection, "meeting-1")
-            })
-            .unwrap()
-            .unwrap();
+        let checkpoint = persistence.find_checkpoint("meeting-1").unwrap().unwrap();
 
         assert_eq!(checkpoint.last_uploaded_mixed_ms, 1_200);
         assert_eq!(checkpoint.last_udp_seq_sent, 0);

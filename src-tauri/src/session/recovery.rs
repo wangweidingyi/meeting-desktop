@@ -1,6 +1,5 @@
+use crate::backend_sync::SessionCheckpointRecord;
 use serde::{Deserialize, Serialize};
-
-use crate::storage::checkpoint_repo::SessionCheckpointRecord;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryPlan {
@@ -29,7 +28,7 @@ pub fn plan_recovery(
 #[cfg(test)]
 mod tests {
     use super::plan_recovery;
-    use crate::storage::checkpoint_repo::SessionCheckpointRecord;
+    use crate::backend_sync::SessionCheckpointRecord;
 
     #[test]
     fn recovery_plan_uses_checkpoint_and_local_audio_duration() {

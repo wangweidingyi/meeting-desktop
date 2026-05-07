@@ -7,8 +7,8 @@ import {
   resumeActiveMeeting,
   startActiveMeeting,
   stopActiveMeeting,
-  syncMeetingToBackend,
 } from "@/lib/api/commands";
+import { getDesktopAuthSession } from "@/lib/auth";
 import {
   type DesktopActionItemsDeltaPayload,
   type DesktopRuntimeDiagnosticsPayload,
@@ -101,14 +101,19 @@ function applyRuntimeDiagnostics(payload: DesktopRuntimeDiagnosticsPayload) {
 
 async function syncBackendRuntimeInfo() {
   const runtime = await getRuntimeBackendInfo();
+  const authSession = getDesktopAuthSession();
 
   let sttProvider = runtime.startupSttProvider;
   let sttModel = runtime.startupSttModel;
   let sttResourceId = runtime.startupSttResourceId;
 
-  if (runtime.adminApiBaseUrl) {
+  if (runtime.adminApiBaseUrl && authSession?.token && authSession.user.role === "admin") {
     try {
-      const response = await fetch(`${runtime.adminApiBaseUrl}/api/admin/settings`);
+      const response = await fetch(`${runtime.adminApiBaseUrl}/api/admin/settings`, {
+        headers: {
+          Authorization: `Bearer ${authSession.token}`,
+        },
+      });
       if (response.ok) {
         const settings = (await response.json()) as AdminSettingsSnapshot;
         sttProvider = settings.ai?.stt?.provider ?? sttProvider;
@@ -237,11 +242,9 @@ export function useLiveSession() {
     try {
       const created = await createMeeting(title);
       useSessionViewStore.getState().hydrateMeetingShell(created.id, created.title, created.started_at);
-      await syncMeetingToBackend(created);
 
       const started = await startActiveMeeting();
       useSessionViewStore.getState().syncFromMeetingRecord(started);
-      await syncMeetingToBackend(started);
     } catch (error) {
       surfaceRuntimeError(error);
       throw error;
@@ -252,7 +255,6 @@ export function useLiveSession() {
     try {
       const meeting = await pauseActiveMeeting();
       useSessionViewStore.getState().syncFromMeetingRecord(meeting);
-      await syncMeetingToBackend(meeting);
     } catch (error) {
       surfaceRuntimeError(error);
       throw error;
@@ -263,7 +265,6 @@ export function useLiveSession() {
     try {
       const meeting = await resumeActiveMeeting();
       useSessionViewStore.getState().syncFromMeetingRecord(meeting);
-      await syncMeetingToBackend(meeting);
     } catch (error) {
       surfaceRuntimeError(error);
       throw error;
@@ -274,7 +275,6 @@ export function useLiveSession() {
     try {
       const meeting = await stopActiveMeeting();
       useSessionViewStore.getState().syncFromMeetingRecord(meeting);
-      await syncMeetingToBackend(meeting);
     } catch (error) {
       surfaceRuntimeError(error);
       throw error;
