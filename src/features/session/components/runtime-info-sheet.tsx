@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Cpu, Info, Radio, Signal, Workflow, X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,6 +40,7 @@ const macosAudioCaptureModeLabelMap: Record<MacosAudioCaptureMode, string> = {
   mirror_microphone: "镜像麦克风",
   system: "全系统输出",
 };
+const SOURCE_ACTIVITY_WINDOW_MS = 3_000;
 
 function formatAudioDuration(durationMs: number) {
   if (durationMs <= 0) {
@@ -89,6 +90,49 @@ function formatBrokerValue(value: string | null) {
   return "未配置，控制消息不会发送";
 }
 
+function formatSourceInputHint(lastInputAt: string | null) {
+  if (!lastInputAt) {
+    return "尚未收到该来源的音频帧。";
+  }
+
+  return `最近收到：${formatTimestamp(lastInputAt)}`;
+}
+
+function isSourceCurrentlyActive(
+  lastInputAt: string | null,
+  fallbackActive: boolean,
+  nowMs: number,
+) {
+  return fallbackActive && wasSourceFrameSeenRecently(lastInputAt, nowMs);
+}
+
+function wasSourceFrameSeenRecently(lastInputAt: string | null, nowMs: number) {
+  if (!lastInputAt || !/^\d+$/.test(lastInputAt)) {
+    return false;
+  }
+
+  const lastInputAtMs = Number(lastInputAt);
+  if (Number.isNaN(lastInputAtMs)) {
+    return false;
+  }
+
+  return nowMs - lastInputAtMs <= SOURCE_ACTIVITY_WINDOW_MS;
+}
+
+function sourceStatusLabel(
+  isActive: boolean,
+  lastInputAt: string | null,
+  nowMs: number,
+) {
+  if (isActive) {
+    return "接收中";
+  }
+  if (wasSourceFrameSeenRecently(lastInputAt, nowMs)) {
+    return "仅静音帧";
+  }
+  return "暂无音频";
+}
+
 function ValueCard({
   label,
   value,
@@ -134,8 +178,19 @@ function Section({
 
 export function RuntimeInfoSheet() {
   const [open, setOpen] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const session = useSessionViewStore();
   const { runtimeInfo } = session;
+  const microphoneInputActive = isSourceCurrentlyActive(
+    runtimeInfo.lastMicrophoneInputAt,
+    runtimeInfo.microphoneInputActive,
+    nowMs,
+  );
+  const systemInputActive = isSourceCurrentlyActive(
+    runtimeInfo.lastSystemInputAt,
+    runtimeInfo.systemInputActive,
+    nowMs,
+  );
   const uploadedDurationMs = normalizeTimelineMs(runtimeInfo.lastUploadedMixedMs, session.startedAtLabel);
   const replayFromMs =
     runtimeInfo.replayFromMs === null
@@ -145,6 +200,16 @@ export function RuntimeInfoSheet() {
     runtimeInfo.replayUntilMs === null
       ? null
       : normalizeTimelineMs(runtimeInfo.replayUntilMs, session.startedAtLabel);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
 
   return (
     <>
@@ -212,6 +277,24 @@ export function RuntimeInfoSheet() {
                       ? macosAudioCaptureModeLabelMap[runtimeInfo.macosAudioCaptureMode]
                       : "未提供"
                   }
+                />
+                <ValueCard
+                  hint={formatSourceInputHint(runtimeInfo.lastMicrophoneInputAt)}
+                  label="麦克风输入"
+                  value={sourceStatusLabel(
+                    microphoneInputActive,
+                    runtimeInfo.lastMicrophoneInputAt,
+                    nowMs,
+                  )}
+                />
+                <ValueCard
+                  hint={formatSourceInputHint(runtimeInfo.lastSystemInputAt)}
+                  label="系统输入"
+                  value={sourceStatusLabel(
+                    systemInputActive,
+                    runtimeInfo.lastSystemInputAt,
+                    nowMs,
+                  )}
                 />
                 <ValueCard
                   hint="按当前会议开始时间换算后的已上行位置，用来确认音频实际已经送到哪里。"

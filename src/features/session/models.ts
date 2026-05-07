@@ -44,6 +44,10 @@ export type SessionViewState = {
     audioTargetAddr: string | null;
     audioUplinkState: AudioUplinkState;
     macosAudioCaptureMode: MacosAudioCaptureMode | null;
+    microphoneInputActive: boolean;
+    systemInputActive: boolean;
+    lastMicrophoneInputAt: string | null;
+    lastSystemInputAt: string | null;
     lastUploadedMixedMs: number;
     lastChunkSequence: number | null;
     lastChunkSentAt: string | null;

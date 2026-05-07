@@ -108,7 +108,7 @@ impl MacosSystemAudioCapture {
         &self,
         sink: PcmFrameCallback,
     ) -> Result<MacosSystemCaptureRuntime, String> {
-        start_core_audio_system_tap(sink)
+        start_native_system_audio_capture(sink)
     }
 }
 
@@ -318,7 +318,7 @@ fn resample_to_target_rate(samples: &[f32], source_rate_hz: u32, target_rate_hz:
         .collect()
 }
 
-fn start_core_audio_system_tap(
+fn start_native_system_audio_capture(
     sink: PcmFrameCallback,
 ) -> Result<MacosSystemCaptureRuntime, String> {
     let (callback_state, worker) = build_callback_worker(sink)?;
@@ -499,8 +499,14 @@ fn read_error_buffer(error_buffer: &[c_char]) -> String {
 }
 
 fn format_start_error(message: &str) -> String {
-    if message.contains("requires macOS 14.2 or newer") {
-        return "macOS system audio capture requires a supported macOS version with Core Audio process taps.".to_string();
+    if message.contains("requires ScreenCaptureKit audio capture") {
+        return "macOS system audio capture requires a supported macOS version with ScreenCaptureKit audio capture.".to_string();
+    }
+
+    if looks_like_screen_recording_permission_denied(message) {
+        return format!(
+            "macOS denied Screen Recording permission required for system audio capture. Grant Screen Recording permission and retry. Native error: {message}"
+        );
     }
 
     if looks_like_permission_denied(message) {
@@ -510,6 +516,14 @@ fn format_start_error(message: &str) -> String {
     }
 
     format!("failed to start macOS system audio capture: {message}")
+}
+
+fn looks_like_screen_recording_permission_denied(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("screen recording permission denied")
+        || normalized.contains("screen recording permission")
+        || normalized.contains("not authorized to capture screen")
+        || normalized.contains("user declined")
 }
 
 fn looks_like_permission_denied(message: &str) -> bool {
@@ -755,11 +769,12 @@ mod tests {
 
     #[test]
     fn format_start_error_explains_unsupported_os() {
-        let error = format_start_error("macOS system audio capture requires macOS 14.2 or newer");
+        let error =
+            format_start_error("macOS system audio capture requires ScreenCaptureKit audio capture");
 
         assert_eq!(
             error,
-            "macOS system audio capture requires a supported macOS version with Core Audio process taps."
+            "macOS system audio capture requires a supported macOS version with ScreenCaptureKit audio capture."
         );
     }
 
@@ -771,6 +786,16 @@ mod tests {
         assert_eq!(
             error,
             "macOS denied system audio capture permission. Grant recording permission and retry. Native error: AudioDeviceStart failed with OSStatus -54 ('perm')"
+        );
+    }
+
+    #[test]
+    fn format_start_error_explains_screen_recording_permission_denied() {
+        let error = format_start_error("screen recording permission denied");
+
+        assert_eq!(
+            error,
+            "macOS denied Screen Recording permission required for system audio capture. Grant Screen Recording permission and retry. Native error: screen recording permission denied"
         );
     }
 

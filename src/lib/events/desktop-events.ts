@@ -106,6 +106,10 @@ export type DesktopRuntimeDiagnosticsPayload = {
   audio_target_addr: string;
   audio_uplink_state: AudioUplinkState;
   macos_audio_capture_mode: MacosAudioCaptureMode | null;
+  microphone_input_active: boolean;
+  system_input_active: boolean;
+  last_microphone_input_at: string | null;
+  last_system_input_at: string | null;
   last_uploaded_mixed_ms: number;
   last_chunk_sequence: number | null;
   last_chunk_sent_at: string | null;

@@ -300,6 +300,10 @@ describe("useLiveSession", () => {
         audio_target_addr: "127.0.0.1:6000",
         audio_uplink_state: "streaming",
         macos_audio_capture_mode: "system",
+        microphone_input_active: true,
+        system_input_active: false,
+        last_microphone_input_at: "2026-04-23T08:00:00Z",
+        last_system_input_at: null,
         last_uploaded_mixed_ms: 12400,
         last_chunk_sequence: 8,
         last_chunk_sent_at: "2026-04-23T08:00:00Z",
@@ -312,6 +316,8 @@ describe("useLiveSession", () => {
     expect(state.runtimeInfo.audioTargetAddr).toBe("127.0.0.1:6000");
     expect(state.runtimeInfo.audioUplinkState).toBe("streaming");
     expect(state.runtimeInfo.macosAudioCaptureMode).toBe("system");
+    expect(state.runtimeInfo.microphoneInputActive).toBe(true);
+    expect(state.runtimeInfo.systemInputActive).toBe(false);
     expect(state.runtimeInfo.lastUploadedMixedMs).toBe(12400);
     expect(state.runtimeInfo.lastChunkSequence).toBe(8);
     expect(state.runtimeInfo.lastChunkSentAt).toBe("2026-04-23T08:00:00Z");

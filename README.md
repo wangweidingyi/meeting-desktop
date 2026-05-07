@@ -27,7 +27,7 @@ Tauri v2 desktop client for the meeting assistant. Rust owns session lifecycle, 
   - Windows capture sink adapters that normalize device frames into 16k mono PCM before handing them to the shared Rust runtime
   - macOS development capture path that records the real default microphone and forwards it through single-source mixed uplink mode for local testing
   - macOS can optionally mirror microphone frames into the persisted `system-original.wav` track and dual-source mixed uplink path when `MEETING_MACOS_DEV_SYSTEM_AUDIO=mirror_microphone` is enabled for local pipeline verification
-  - macOS Core Audio system capture bridge API for process-tap based system audio capture
+  - macOS ScreenCaptureKit system audio capture bridge for real system output capture
   - UDP audio transport socket setup and packet encoding
   - runtime event processing into SQLite and Tauri frontend events
   - backend Go runtime with live UDP listener
@@ -42,7 +42,7 @@ If `MEETING_SERVER_MQTT_BROKER` is set, the desktop control channel uses a real 
 
 Copy [`.env.example`](/Users/cxc/Documents/open/meeting/meeting-desktop/.env.example) to `.env`.
 
-The real macOS system audio capture bridge uses Core Audio process taps. Building it requires Command Line Tools / a macOS SDK that includes `CoreAudio/AudioHardwareTapping.h` and `CoreAudio/CATapDescription.h`; running real system audio capture requires macOS 14.2 or newer.
+The real macOS system audio capture bridge uses ScreenCaptureKit audio capture. Building it requires Command Line Tools / a macOS SDK that includes `ScreenCaptureKit.framework`; running real system audio capture requires Screen Recording permission.
 
 Supported desktop variables:
 

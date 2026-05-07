@@ -20,6 +20,8 @@ use crate::storage::db::Database;
 use crate::transport::audio_transport::{AudioTransport, AudioUploadProgress};
 
 const DEFAULT_BUFFER_WINDOW_MS: u32 = 30_000;
+const SOURCE_ACTIVITY_WINDOW_MS: u64 = 3_000;
+const SOURCE_DIAGNOSTICS_PUBLISH_INTERVAL_MS: u64 = 500;
 
 pub struct MeetingAudioRuntime<T>
 where
@@ -40,6 +42,11 @@ where
     event_bus: EventBus,
     audio_target_addr: String,
     macos_audio_capture_mode: Option<String>,
+    last_microphone_input_at_ms: Option<u64>,
+    last_system_input_at_ms: Option<u64>,
+    last_microphone_signal_at_ms: Option<u64>,
+    last_system_signal_at_ms: Option<u64>,
+    last_source_diagnostics_published_at_ms: Option<u64>,
 }
 
 impl<T> MeetingAudioRuntime<T>
@@ -77,6 +84,11 @@ where
             event_bus,
             audio_target_addr,
             macos_audio_capture_mode: None,
+            last_microphone_input_at_ms: None,
+            last_system_input_at_ms: None,
+            last_microphone_signal_at_ms: None,
+            last_system_signal_at_ms: None,
+            last_source_diagnostics_published_at_ms: None,
         }
     }
 
@@ -238,6 +250,7 @@ where
             return Err("audio runtime has not been started".to_string());
         }
 
+        self.record_source_input(&source, samples);
         self.append_source_wave(&source, samples)?;
 
         match source {
@@ -254,6 +267,8 @@ where
                 self.channels,
             ),
         }
+
+        self.publish_source_diagnostics_if_due()?;
 
         if let AudioUplinkStrategy::PassthroughSingleSource(primary_source) = &self.uplink_strategy
         {
@@ -471,6 +486,7 @@ where
         let (replay_from_ms, replay_until_ms) = replay_window
             .map(|(from, until)| (Some(from), Some(until)))
             .unwrap_or((None, None));
+        let source_diagnostics = self.build_source_diagnostics(current_timestamp_ms());
 
         self.event_bus
             .publish(RuntimeEvent::RuntimeDiagnosticsUpdated(
@@ -479,6 +495,10 @@ where
                     audio_target_addr: self.audio_target_addr.clone(),
                     audio_uplink_state,
                     macos_audio_capture_mode: self.macos_audio_capture_mode.clone(),
+                    microphone_input_active: source_diagnostics.microphone_input_active,
+                    system_input_active: source_diagnostics.system_input_active,
+                    last_microphone_input_at: source_diagnostics.last_microphone_input_at,
+                    last_system_input_at: source_diagnostics.last_system_input_at,
                     last_uploaded_mixed_ms,
                     last_chunk_sequence,
                     last_chunk_sent_at,
@@ -500,6 +520,56 @@ where
             })
             .unwrap_or(0))
     }
+
+    fn record_source_input(&mut self, source: &CaptureSourceKind, samples: &[i16]) {
+        let now_ms = current_timestamp_ms();
+        match source {
+            CaptureSourceKind::Microphone => {
+                self.last_microphone_input_at_ms = Some(now_ms);
+                if has_non_silent_samples(samples) {
+                    self.last_microphone_signal_at_ms = Some(now_ms);
+                }
+            }
+            CaptureSourceKind::SystemLoopback => {
+                self.last_system_input_at_ms = Some(now_ms);
+                if has_non_silent_samples(samples) {
+                    self.last_system_signal_at_ms = Some(now_ms);
+                }
+            }
+        }
+    }
+
+    fn publish_source_diagnostics_if_due(&mut self) -> Result<(), String> {
+        let now_ms = current_timestamp_ms();
+        if let Some(last_published_at_ms) = self.last_source_diagnostics_published_at_ms {
+            if now_ms.saturating_sub(last_published_at_ms) < SOURCE_DIAGNOSTICS_PUBLISH_INTERVAL_MS
+            {
+                return Ok(());
+            }
+        }
+
+        let checkpoint = self
+            .load_checkpoint()?
+            .unwrap_or_else(|| default_checkpoint(&self.meeting_id));
+        self.publish_runtime_diagnostics(
+            diagnostics_uplink_state_from_checkpoint(&checkpoint),
+            checkpoint.last_uploaded_mixed_ms,
+            sequence_for_diagnostics(&checkpoint),
+            None,
+        )?;
+        self.last_source_diagnostics_published_at_ms = Some(now_ms);
+
+        Ok(())
+    }
+
+    fn build_source_diagnostics(&self, now_ms: u64) -> SourceInputDiagnostics {
+        SourceInputDiagnostics {
+            microphone_input_active: is_source_active(self.last_microphone_signal_at_ms, now_ms),
+            system_input_active: is_source_active(self.last_system_signal_at_ms, now_ms),
+            last_microphone_input_at: self.last_microphone_input_at_ms.map(|value| value.to_string()),
+            last_system_input_at: self.last_system_input_at_ms.map(|value| value.to_string()),
+        }
+    }
 }
 
 fn sequence_for_diagnostics(checkpoint: &SessionCheckpointRecord) -> Option<u64> {
@@ -508,6 +578,38 @@ fn sequence_for_diagnostics(checkpoint: &SessionCheckpointRecord) -> Option<u64>
     } else {
         Some(checkpoint.last_udp_seq_sent)
     }
+}
+
+fn diagnostics_uplink_state_from_checkpoint(checkpoint: &SessionCheckpointRecord) -> AudioUplinkState {
+    match checkpoint.local_recording_state.as_str() {
+        "prepared" => AudioUplinkState::Idle,
+        "paused" => AudioUplinkState::Paused,
+        "stopped" => AudioUplinkState::Stopped,
+        "recording" => {
+            if checkpoint.last_uploaded_mixed_ms > 0 {
+                AudioUplinkState::Streaming
+            } else {
+                AudioUplinkState::WaitingForAudio
+            }
+        }
+        _ => {
+            if checkpoint.last_uploaded_mixed_ms > 0 {
+                AudioUplinkState::Streaming
+            } else {
+                AudioUplinkState::Idle
+            }
+        }
+    }
+}
+
+fn is_source_active(last_input_at_ms: Option<u64>, now_ms: u64) -> bool {
+    last_input_at_ms
+        .map(|last_input_at_ms| now_ms.saturating_sub(last_input_at_ms) <= SOURCE_ACTIVITY_WINDOW_MS)
+        .unwrap_or(false)
+}
+
+fn has_non_silent_samples(samples: &[i16]) -> bool {
+    samples.iter().any(|sample| *sample != 0)
 }
 
 fn default_checkpoint(meeting_id: &str) -> SessionCheckpointRecord {
@@ -526,10 +628,22 @@ fn default_checkpoint(meeting_id: &str) -> SessionCheckpointRecord {
 }
 
 fn current_timestamp_label() -> String {
+    current_timestamp_ms().to_string()
+}
+
+fn current_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceInputDiagnostics {
+    microphone_input_active: bool,
+    system_input_active: bool,
+    last_microphone_input_at: Option<String>,
+    last_system_input_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +936,66 @@ mod tests {
                     && payload.macos_audio_capture_mode.as_deref() == Some("system")
                     && payload.last_uploaded_mixed_ms == 1_200
                     && payload.last_chunk_sequence == Some(0)
+        )));
+    }
+
+    #[test]
+    fn source_input_diagnostics_mark_microphone_active_before_system_audio_arrives() {
+        let database = Database::open_in_memory().unwrap();
+        let event_bus = EventBus::default();
+        let mut runtime = MeetingAudioRuntime::new(
+            database.clone(),
+            env::temp_dir(),
+            UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
+            AudioCoordinatorConfig::new("meeting-1"),
+            event_bus.clone(),
+            "127.0.0.1:6000".to_string(),
+        );
+
+        runtime.prepare().unwrap();
+        runtime.start_capture().unwrap();
+        runtime
+            .push_source_samples(CaptureSourceKind::Microphone, 1_000, &vec![1000; 1_600])
+            .unwrap();
+
+        let events = event_bus.snapshot().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RuntimeDiagnosticsUpdated(payload)
+                if payload.audio_uplink_state == crate::events::types::AudioUplinkState::WaitingForAudio
+                    && payload.microphone_input_active
+                    && !payload.system_input_active
+                    && payload.last_microphone_input_at.is_some()
+                    && payload.last_system_input_at.is_none()
+        )));
+    }
+
+    #[test]
+    fn source_input_diagnostics_keep_silent_system_frames_inactive() {
+        let database = Database::open_in_memory().unwrap();
+        let event_bus = EventBus::default();
+        let mut runtime = MeetingAudioRuntime::new(
+            database.clone(),
+            env::temp_dir(),
+            UdpAudioTransport::new("meeting-1", InMemoryUdpSocket::default()),
+            AudioCoordinatorConfig::new("meeting-1"),
+            event_bus.clone(),
+            "127.0.0.1:6000".to_string(),
+        );
+
+        runtime.prepare().unwrap();
+        runtime.start_capture().unwrap();
+        runtime
+            .push_source_samples(CaptureSourceKind::SystemLoopback, 1_000, &vec![0; 1_600])
+            .unwrap();
+
+        let events = event_bus.snapshot().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RuntimeDiagnosticsUpdated(payload)
+                if payload.audio_uplink_state == crate::events::types::AudioUplinkState::WaitingForAudio
+                    && !payload.system_input_active
+                    && payload.last_system_input_at.is_some()
         )));
     }
 

@@ -40,6 +40,10 @@ export function createInitialSessionViewState(): SessionViewState {
       audioTargetAddr: null,
       audioUplinkState: "idle",
       macosAudioCaptureMode: null,
+      microphoneInputActive: false,
+      systemInputActive: false,
+      lastMicrophoneInputAt: null,
+      lastSystemInputAt: null,
       lastUploadedMixedMs: 0,
       lastChunkSequence: null,
       lastChunkSentAt: null,
@@ -106,6 +110,10 @@ type SessionViewStore = SessionViewState & {
     audioTargetAddr: string;
     audioUplinkState: AudioUplinkState;
     macosAudioCaptureMode: MacosAudioCaptureMode | null;
+    microphoneInputActive: boolean;
+    systemInputActive: boolean;
+    lastMicrophoneInputAt: string | null;
+    lastSystemInputAt: string | null;
     lastUploadedMixedMs: number;
     lastChunkSequence: number | null;
     lastChunkSentAt: string | null;
@@ -250,6 +258,10 @@ export const useSessionViewStore = create<SessionViewStore>((set) => ({
         audioTargetAddr: payload.audioTargetAddr,
         audioUplinkState: payload.audioUplinkState,
         macosAudioCaptureMode: payload.macosAudioCaptureMode,
+        microphoneInputActive: payload.microphoneInputActive,
+        systemInputActive: payload.systemInputActive,
+        lastMicrophoneInputAt: payload.lastMicrophoneInputAt,
+        lastSystemInputAt: payload.lastSystemInputAt,
         lastUploadedMixedMs: payload.lastUploadedMixedMs,
         lastChunkSequence: payload.lastChunkSequence,
         lastChunkSentAt: payload.lastChunkSentAt,

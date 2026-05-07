@@ -23,6 +23,10 @@ describe("RuntimeInfoSheet", () => {
         audioTargetAddr: "127.0.0.1:6000",
         audioUplinkState: "streaming",
         macosAudioCaptureMode: "system",
+        microphoneInputActive: true,
+        systemInputActive: false,
+        lastMicrophoneInputAt: Date.now().toString(),
+        lastSystemInputAt: null,
         lastUploadedMixedMs: 1777031710400,
         lastChunkSequence: 8,
         lastChunkSentAt: "2026-04-23T15:00:12Z",
@@ -36,7 +40,7 @@ describe("RuntimeInfoSheet", () => {
         sttModel: "bigmodel",
         sttResourceId: "volc.seedasr.sauc.duration",
       },
-    });
+    } as never);
 
     render(<RuntimeInfoSheet />);
 
@@ -51,6 +55,10 @@ describe("RuntimeInfoSheet", () => {
     expect(screen.getByText("bigmodel")).toBeInTheDocument();
     expect(screen.getByText("系统音频")).toBeInTheDocument();
     expect(screen.getByText("全系统输出")).toBeInTheDocument();
+    expect(screen.getByText("麦克风输入")).toBeInTheDocument();
+    expect(screen.getByText("系统输入")).toBeInTheDocument();
+    expect(screen.getByText("接收中")).toBeInTheDocument();
+    expect(screen.getByText("暂无音频")).toBeInTheDocument();
     expect(screen.getAllByText("实时上行中").length).toBeGreaterThan(0);
     expect(screen.getByText("38.4 秒")).toBeInTheDocument();
     expect(screen.getByText("控制链路稳定")).toBeInTheDocument();
@@ -69,6 +77,10 @@ describe("RuntimeInfoSheet", () => {
         audioTargetAddr: "127.0.0.1:6000",
         audioUplinkState: "streaming",
         macosAudioCaptureMode: "microphone_only",
+        microphoneInputActive: true,
+        systemInputActive: false,
+        lastMicrophoneInputAt: Date.now().toString(),
+        lastSystemInputAt: null,
         lastUploadedMixedMs: 2000,
         lastChunkSequence: 3,
         lastChunkSentAt: "2026-04-24T20:00:02Z",
@@ -89,5 +101,42 @@ describe("RuntimeInfoSheet", () => {
     fireEvent.click(screen.getByRole("button", { name: "运行信息" }));
 
     expect(screen.getByText("未配置，控制消息不会发送")).toBeInTheDocument();
+  });
+
+  it("distinguishes silent frames from missing audio", () => {
+    useSessionViewStore.setState({
+      activeMeetingId: "meeting-3",
+      title: "系统音频排查",
+      status: "recording",
+      connectionState: "connected",
+      startedAtLabel: null,
+      runtimeInfo: {
+        audioTargetAddr: "127.0.0.1:6000",
+        audioUplinkState: "waiting_for_audio",
+        macosAudioCaptureMode: "system",
+        microphoneInputActive: false,
+        systemInputActive: false,
+        lastMicrophoneInputAt: null,
+        lastSystemInputAt: Date.now().toString(),
+        lastUploadedMixedMs: 0,
+        lastChunkSequence: null,
+        lastChunkSentAt: null,
+        replayFromMs: null,
+        replayUntilMs: null,
+        lastTransportError: null,
+        mqttBrokerUrl: "tcp://127.0.0.1:1883",
+        controlClientId: "meeting-desktop",
+        adminApiBaseUrl: "http://127.0.0.1:8090",
+        sttProvider: "volcengine_streaming",
+        sttModel: "bigmodel",
+        sttResourceId: "volc.seedasr.sauc.duration",
+      },
+    });
+
+    render(<RuntimeInfoSheet />);
+
+    fireEvent.click(screen.getByRole("button", { name: "运行信息" }));
+
+    expect(screen.getByText("仅静音帧")).toBeInTheDocument();
   });
 });

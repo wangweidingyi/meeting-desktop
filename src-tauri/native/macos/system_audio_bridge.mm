@@ -1,9 +1,10 @@
 #include "system_audio_bridge.h"
 
-#import <CoreAudio/AudioHardware.h>
-#import <CoreAudio/AudioHardwareTapping.h>
-#import <CoreAudio/CATapDescription.h>
+#import <ApplicationServices/ApplicationServices.h>
+#import <CoreAudio/CoreAudio.h>
+#import <CoreMedia/CoreMedia.h>
 #import <Foundation/Foundation.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
 
 #include <algorithm>
 #include <chrono>
@@ -15,21 +16,6 @@
 #include <vector>
 
 namespace {
-
-struct MeetingSystemAudioHandle {
-    meeting_system_audio_callback callback = nullptr;
-    void *user_data = nullptr;
-    AudioObjectID tap_id = kAudioObjectUnknown;
-    AudioObjectID aggregate_device_id = kAudioObjectUnknown;
-    AudioDeviceIOProcID io_proc_id = nullptr;
-    uint32_t sample_rate_hz = 0;
-    uint16_t channels = 0;
-    bool started = false;
-};
-
-NSString *dictionary_key(const char *key) {
-    return [NSString stringWithUTF8String:key];
-}
 
 uint64_t current_unix_ms() {
     using namespace std::chrono;
@@ -55,7 +41,7 @@ std::string fourcc(OSStatus status) {
 }
 
 std::string osstatus_message(const char *operation, OSStatus status) {
-    char buffer[160];
+    char buffer[192];
     std::string status_fourcc = fourcc(status);
     if (status_fourcc.empty()) {
         std::snprintf(buffer, sizeof(buffer), "%s failed with OSStatus %d", operation, status);
@@ -71,6 +57,18 @@ std::string osstatus_message(const char *operation, OSStatus status) {
     return std::string(buffer);
 }
 
+std::string ns_error_message(const char *operation, NSError *error) {
+    if (error == nil) {
+        return std::string(operation) + " failed";
+    }
+
+    return
+        std::string(operation) + " failed [" +
+        std::string([[error domain] UTF8String]) + " " +
+        std::to_string(static_cast<long long>(error.code)) + "]: " +
+        std::string([[error localizedDescription] UTF8String]);
+}
+
 void set_error(char *error_buffer, size_t error_buffer_len, const std::string &message) {
     if (error_buffer == nullptr || error_buffer_len == 0) {
         return;
@@ -79,153 +77,391 @@ void set_error(char *error_buffer, size_t error_buffer_len, const std::string &m
     std::snprintf(error_buffer, error_buffer_len, "%s", message.c_str());
 }
 
-void log_teardown_status(const char *operation, OSStatus status) {
-    if (status == noErr) {
-        return;
-    }
-
-    std::string message = osstatus_message(operation, status);
-    NSLog(@"Meeting system audio teardown: %s", message.c_str());
+bool wait_for_dispatch_semaphore(dispatch_semaphore_t semaphore, int64_t timeout_ms) {
+    return dispatch_semaphore_wait(
+               semaphore,
+               dispatch_time(DISPATCH_TIME_NOW, timeout_ms * NSEC_PER_MSEC)) == 0;
 }
 
-bool get_tap_uid(AudioObjectID tap_id, NSString **out_uid, std::string &error) {
-    CFStringRef tap_uid = nullptr;
-    UInt32 property_size = sizeof(tap_uid);
-    AudioObjectPropertyAddress address = {
-        kAudioTapPropertyUID,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain,
-    };
-
-    OSStatus status = AudioObjectGetPropertyData(
-        tap_id,
-        &address,
-        0,
-        nullptr,
-        &property_size,
-        &tap_uid);
-    if (status != noErr) {
-        error = osstatus_message("AudioObjectGetPropertyData(kAudioTapPropertyUID)", status);
-        return false;
-    }
-    if (tap_uid == nullptr) {
-        error = "AudioObjectGetPropertyData(kAudioTapPropertyUID) returned no UID";
-        return false;
+SCDisplay *select_capture_display(SCShareableContent *shareable_content) {
+    if (shareable_content == nil || shareable_content.displays.count == 0) {
+        return nil;
     }
 
-    *out_uid = CFBridgingRelease(tap_uid);
-    return true;
+    CGDirectDisplayID main_display_id = CGMainDisplayID();
+    for (SCDisplay *display in shareable_content.displays) {
+        if (display.displayID == main_display_id) {
+            return display;
+        }
+    }
+
+    return shareable_content.displays.firstObject;
 }
 
-bool get_tap_format(
-    AudioObjectID tap_id,
-    AudioStreamBasicDescription &format,
+bool extract_interleaved_float_samples(
+    CMSampleBufferRef sample_buffer,
+    std::vector<float> &out_samples,
+    uint32_t &out_sample_rate_hz,
+    uint16_t &out_channels,
     std::string &error) {
-    UInt32 property_size = sizeof(format);
-    AudioObjectPropertyAddress address = {
-        kAudioTapPropertyFormat,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain,
-    };
+    if (sample_buffer == nullptr || !CMSampleBufferIsValid(sample_buffer)) {
+        error = "ScreenCaptureKit delivered an invalid audio sample buffer";
+        return false;
+    }
 
-    OSStatus status = AudioObjectGetPropertyData(
-        tap_id,
-        &address,
-        0,
+    CMFormatDescriptionRef format_description = CMSampleBufferGetFormatDescription(sample_buffer);
+    if (format_description == nullptr) {
+        error = "ScreenCaptureKit audio sample buffer has no format description";
+        return false;
+    }
+
+    const AudioStreamBasicDescription *format =
+        CMAudioFormatDescriptionGetStreamBasicDescription(
+            static_cast<CMAudioFormatDescriptionRef>(format_description));
+    if (format == nullptr) {
+        error = "ScreenCaptureKit audio sample buffer has no stream format";
+        return false;
+    }
+
+    if (format->mChannelsPerFrame == 0 || format->mSampleRate <= 0) {
+        error = "ScreenCaptureKit audio sample buffer returned an invalid stream format";
+        return false;
+    }
+
+    const CMItemCount frame_count = CMSampleBufferGetNumSamples(sample_buffer);
+    if (frame_count <= 0) {
+        return false;
+    }
+
+    size_t buffer_list_size = 0;
+    OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sample_buffer,
+        &buffer_list_size,
         nullptr,
-        &property_size,
-        &format);
+        0,
+        kCFAllocatorDefault,
+        kCFAllocatorDefault,
+        kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+        nullptr);
+    if (status != noErr || buffer_list_size == 0) {
+        error = osstatus_message(
+            "CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(size query)",
+            status);
+        return false;
+    }
+
+    std::vector<uint8_t> buffer_list_storage(buffer_list_size);
+    auto *buffer_list = reinterpret_cast<AudioBufferList *>(buffer_list_storage.data());
+    CMBlockBufferRef retained_block_buffer = nullptr;
+    status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sample_buffer,
+        nullptr,
+        buffer_list,
+        buffer_list_size,
+        kCFAllocatorDefault,
+        kCFAllocatorDefault,
+        kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+        &retained_block_buffer);
     if (status != noErr) {
-        error = osstatus_message("AudioObjectGetPropertyData(kAudioTapPropertyFormat)", status);
+        error = osstatus_message(
+            "CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer",
+            status);
         return false;
     }
 
-    const bool is_pcm = format.mFormatID == kAudioFormatLinearPCM;
-    const bool is_float = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
-    if (!is_pcm || !is_float || format.mBitsPerChannel != 32) {
-        error = "Core Audio system tap format is not 32-bit float PCM";
+    const bool is_linear_pcm = format->mFormatID == kAudioFormatLinearPCM;
+    const bool is_float32 =
+        is_linear_pcm &&
+        (format->mFormatFlags & kAudioFormatFlagIsFloat) != 0 &&
+        format->mBitsPerChannel == 32;
+    const bool is_int16 =
+        is_linear_pcm &&
+        (format->mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0 &&
+        format->mBitsPerChannel == 16;
+    const bool is_non_interleaved =
+        (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+    const UInt32 channels = format->mChannelsPerFrame;
+
+    out_sample_rate_hz = static_cast<uint32_t>(std::llround(format->mSampleRate));
+    out_channels = static_cast<uint16_t>(std::min<UInt32>(channels, UINT16_MAX));
+    out_samples.clear();
+    out_samples.reserve(static_cast<size_t>(frame_count) * channels);
+
+    if (!is_float32 && !is_int16) {
+        if (retained_block_buffer != nullptr) {
+            CFRelease(retained_block_buffer);
+        }
+        error = "ScreenCaptureKit audio sample buffer is not float32 or int16 PCM";
         return false;
     }
-    if (format.mSampleRate <= 0 || format.mChannelsPerFrame == 0) {
-        error = "Core Audio system tap returned an invalid stream format";
-        return false;
-    }
 
-    return true;
-}
-
-OSStatus system_audio_io_proc(
-    AudioObjectID,
-    const AudioTimeStamp *,
-    const AudioBufferList *in_input_data,
-    const AudioTimeStamp *,
-    AudioBufferList *,
-    const AudioTimeStamp *,
-    void *client_data) {
-    auto *handle = static_cast<MeetingSystemAudioHandle *>(client_data);
-    if (handle == nullptr || handle->callback == nullptr || in_input_data == nullptr) {
-        return noErr;
-    }
-
-    if (in_input_data->mNumberBuffers == 0) {
-        return noErr;
-    }
-
-    if (in_input_data->mNumberBuffers == 1) {
-        const AudioBuffer &buffer = in_input_data->mBuffers[0];
-        if (buffer.mData == nullptr || buffer.mDataByteSize == 0) {
-            return noErr;
+    if (is_non_interleaved) {
+        if (buffer_list->mNumberBuffers < channels) {
+            if (retained_block_buffer != nullptr) {
+                CFRelease(retained_block_buffer);
+            }
+            error = "ScreenCaptureKit returned fewer audio buffers than channel count";
+            return false;
         }
 
-        const uint16_t channels = buffer.mNumberChannels > 0
-            ? static_cast<uint16_t>(std::min<UInt32>(buffer.mNumberChannels, UINT16_MAX))
-            : handle->channels;
-        const size_t sample_count = buffer.mDataByteSize / sizeof(float);
-        handle->callback(
-            handle->user_data,
-            current_unix_ms(),
-            static_cast<const float *>(buffer.mData),
-            sample_count,
-            handle->sample_rate_hz,
-            channels);
-        return noErr;
-    }
+        for (CMItemCount frame_index = 0; frame_index < frame_count; ++frame_index) {
+            for (UInt32 channel_index = 0; channel_index < channels; ++channel_index) {
+                const AudioBuffer &buffer = buffer_list->mBuffers[channel_index];
+                if (buffer.mData == nullptr) {
+                    out_samples.push_back(0.0f);
+                    continue;
+                }
 
-    const UInt32 buffer_count = in_input_data->mNumberBuffers;
-    const UInt32 channels = std::min<UInt32>(buffer_count, UINT16_MAX);
-    size_t frame_count = SIZE_MAX;
-    for (UInt32 buffer_index = 0; buffer_index < buffer_count; ++buffer_index) {
-        const AudioBuffer &buffer = in_input_data->mBuffers[buffer_index];
-        if (buffer.mData == nullptr) {
-            continue;
+                if (is_float32) {
+                    const float *data = static_cast<const float *>(buffer.mData);
+                    out_samples.push_back(data[frame_index]);
+                } else {
+                    const int16_t *data = static_cast<const int16_t *>(buffer.mData);
+                    out_samples.push_back(
+                        static_cast<float>(data[frame_index]) / static_cast<float>(INT16_MAX));
+                }
+            }
         }
-        frame_count = std::min(frame_count, static_cast<size_t>(buffer.mDataByteSize / sizeof(float)));
-    }
-    if (frame_count == SIZE_MAX || frame_count == 0) {
-        return noErr;
-    }
+    } else {
+        if (buffer_list->mNumberBuffers == 0 || buffer_list->mBuffers[0].mData == nullptr) {
+            if (retained_block_buffer != nullptr) {
+                CFRelease(retained_block_buffer);
+            }
+            error = "ScreenCaptureKit returned no interleaved audio buffer data";
+            return false;
+        }
 
-    std::vector<float> interleaved;
-    interleaved.reserve(frame_count * channels);
-    for (size_t frame_index = 0; frame_index < frame_count; ++frame_index) {
-        for (UInt32 buffer_index = 0; buffer_index < channels; ++buffer_index) {
-            const AudioBuffer &buffer = in_input_data->mBuffers[buffer_index];
-            const float *data = static_cast<const float *>(buffer.mData);
-            interleaved.push_back(data == nullptr ? 0.0f : data[frame_index]);
+        const size_t sample_count = static_cast<size_t>(frame_count) * channels;
+        out_samples.resize(sample_count);
+        if (is_float32) {
+            const float *data = static_cast<const float *>(buffer_list->mBuffers[0].mData);
+            std::copy(data, data + sample_count, out_samples.begin());
+        } else {
+            const int16_t *data = static_cast<const int16_t *>(buffer_list->mBuffers[0].mData);
+            for (size_t sample_index = 0; sample_index < sample_count; ++sample_index) {
+                out_samples[sample_index] =
+                    static_cast<float>(data[sample_index]) / static_cast<float>(INT16_MAX);
+            }
         }
     }
 
-    handle->callback(
-        handle->user_data,
-        current_unix_ms(),
-        interleaved.data(),
-        interleaved.size(),
-        handle->sample_rate_hz,
-        static_cast<uint16_t>(channels));
-    return noErr;
+    if (retained_block_buffer != nullptr) {
+        CFRelease(retained_block_buffer);
+    }
+
+    return !out_samples.empty();
 }
 
 }  // namespace
+
+API_AVAILABLE(macos(13.0))
+@interface MeetingSystemAudioCaptureSession : NSObject <SCStreamOutput, SCStreamDelegate>
+
+- (instancetype)initWithCallback:(meeting_system_audio_callback)callback
+                        userData:(void *)userData;
+- (BOOL)startWithErrorMessage:(std::string &)errorMessage;
+- (void)stop;
+
+@end
+
+API_AVAILABLE(macos(13.0))
+@implementation MeetingSystemAudioCaptureSession {
+    meeting_system_audio_callback _callback;
+    void *_userData;
+    SCStream *_stream;
+    dispatch_queue_t _sampleQueue;
+    BOOL _started;
+}
+
+- (instancetype)initWithCallback:(meeting_system_audio_callback)callback
+                        userData:(void *)userData {
+    self = [super init];
+    if (self != nil) {
+        _callback = callback;
+        _userData = userData;
+    }
+    return self;
+}
+
+- (SCDisplay *)loadDisplayWithErrorMessage:(std::string &)errorMessage {
+    __block SCShareableContent *shareableContent = nil;
+    __block NSError *shareableContentError = nil;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+
+    [SCShareableContent getShareableContentWithCompletionHandler:^(
+        SCShareableContent * _Nullable content,
+        NSError * _Nullable error
+    ) {
+        shareableContent = content;
+        shareableContentError = error;
+        dispatch_semaphore_signal(semaphore);
+    }];
+
+    if (!wait_for_dispatch_semaphore(semaphore, 10'000)) {
+        errorMessage = "timed out waiting for ScreenCaptureKit shareable content";
+        return nil;
+    }
+
+    if (shareableContentError != nil) {
+        if ([shareableContentError.domain isEqualToString:SCStreamErrorDomain] &&
+            shareableContentError.code == SCStreamErrorUserDeclined) {
+            errorMessage = "screen recording permission denied";
+        } else {
+            errorMessage =
+                ns_error_message("SCShareableContent getShareableContent", shareableContentError);
+        }
+        return nil;
+    }
+
+    SCDisplay *display = select_capture_display(shareableContent);
+    if (display == nil) {
+        errorMessage = "ScreenCaptureKit returned no displays to capture";
+        return nil;
+    }
+
+    return display;
+}
+
+- (BOOL)startWithErrorMessage:(std::string &)errorMessage {
+    if (_callback == nullptr) {
+        errorMessage = "callback must not be null";
+        return NO;
+    }
+
+    if (!CGPreflightScreenCaptureAccess() && !CGRequestScreenCaptureAccess()) {
+        errorMessage = "screen recording permission denied";
+        return NO;
+    }
+
+    SCDisplay *display = [self loadDisplayWithErrorMessage:errorMessage];
+    if (display == nil) {
+        return NO;
+    }
+
+    SCContentFilter *filter =
+        [[SCContentFilter alloc] initWithDisplay:display
+                            excludingApplications:@[]
+                                 exceptingWindows:@[]];
+    SCStreamConfiguration *configuration = [[SCStreamConfiguration alloc] init];
+    configuration.width = static_cast<size_t>(std::max<NSInteger>(display.width, 1));
+    configuration.height = static_cast<size_t>(std::max<NSInteger>(display.height, 1));
+    configuration.minimumFrameInterval = CMTimeMake(1, 60);
+    configuration.queueDepth = 3;
+    configuration.showsCursor = NO;
+    configuration.capturesAudio = YES;
+    configuration.sampleRate = 48'000;
+    configuration.channelCount = 2;
+    configuration.excludesCurrentProcessAudio = YES;
+
+    _sampleQueue = dispatch_queue_create("com.cxc.meeting.system-audio", DISPATCH_QUEUE_SERIAL);
+    _stream = [[SCStream alloc] initWithFilter:filter configuration:configuration delegate:self];
+
+    NSError *addOutputError = nil;
+    if (![_stream addStreamOutput:self
+                             type:SCStreamOutputTypeAudio
+               sampleHandlerQueue:_sampleQueue
+                            error:&addOutputError]) {
+        errorMessage = ns_error_message("SCStream addStreamOutput", addOutputError);
+        _stream = nil;
+        _sampleQueue = nil;
+        return NO;
+    }
+
+    __block NSError *startError = nil;
+    dispatch_semaphore_t startSemaphore = dispatch_semaphore_create(0);
+    [_stream startCaptureWithCompletionHandler:^(NSError * _Nullable error) {
+        startError = error;
+        dispatch_semaphore_signal(startSemaphore);
+    }];
+
+    if (!wait_for_dispatch_semaphore(startSemaphore, 10'000)) {
+        errorMessage = "timed out waiting for ScreenCaptureKit capture start";
+        [self stop];
+        return NO;
+    }
+
+    if (startError != nil) {
+        if ([startError.domain isEqualToString:SCStreamErrorDomain] &&
+            startError.code == SCStreamErrorUserDeclined) {
+            errorMessage = "screen recording permission denied";
+        } else {
+            errorMessage = ns_error_message("SCStream startCapture", startError);
+        }
+        [self stop];
+        return NO;
+    }
+
+    _started = YES;
+    return YES;
+}
+
+- (void)stop {
+    SCStream *stream = _stream;
+    _stream = nil;
+    _started = NO;
+
+    if (stream == nil) {
+        _sampleQueue = nil;
+        return;
+    }
+
+    NSError *removeOutputError = nil;
+    [stream removeStreamOutput:self type:SCStreamOutputTypeAudio error:&removeOutputError];
+
+    dispatch_semaphore_t stopSemaphore = dispatch_semaphore_create(0);
+    [stream stopCaptureWithCompletionHandler:^(NSError * _Nullable error) {
+        if (error != nil) {
+            NSLog(@"Meeting system audio stop: %@", error.localizedDescription);
+        }
+        dispatch_semaphore_signal(stopSemaphore);
+    }];
+    wait_for_dispatch_semaphore(stopSemaphore, 5'000);
+    _sampleQueue = nil;
+}
+
+- (void)stream:(SCStream *)stream
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+        ofType:(SCStreamOutputType)type {
+    if (!_started || type != SCStreamOutputTypeAudio) {
+        return;
+    }
+
+    std::vector<float> samples;
+    uint32_t sampleRateHz = 0;
+    uint16_t channels = 0;
+    std::string error;
+    if (!extract_interleaved_float_samples(
+            sampleBuffer,
+            samples,
+            sampleRateHz,
+            channels,
+            error)) {
+        if (!error.empty()) {
+            NSLog(@"Meeting system audio sample conversion: %s", error.c_str());
+        }
+        return;
+    }
+
+    if (samples.empty()) {
+        return;
+    }
+
+    _callback(
+        _userData,
+        current_unix_ms(),
+        samples.data(),
+        samples.size(),
+        sampleRateHz,
+        channels);
+}
+
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    if (error != nil) {
+        NSLog(@"Meeting system audio stream stopped: %@", error.localizedDescription);
+    }
+}
+
+@end
 
 extern "C" bool meeting_system_audio_start(
     meeting_system_audio_callback callback,
@@ -245,106 +481,25 @@ extern "C" bool meeting_system_audio_start(
     }
 
     @autoreleasepool {
-        if (@available(macOS 14.2, *)) {
-            auto *handle = new MeetingSystemAudioHandle();
-            handle->callback = callback;
-            handle->user_data = user_data;
-
-            CATapDescription *tap_description =
-                [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
-            tap_description.name = @"Meeting System Audio";
-            tap_description.privateTap = YES;
-            tap_description.muteBehavior = CATapUnmuted;
-
-            OSStatus status =
-                AudioHardwareCreateProcessTap(tap_description, &handle->tap_id);
-            if (status != noErr) {
-                set_error(
-                    error_buffer,
-                    error_buffer_len,
-                    osstatus_message("AudioHardwareCreateProcessTap", status));
-                delete handle;
-                return false;
-            }
-
+        if (@available(macOS 13.0, *)) {
+            MeetingSystemAudioCaptureSession *session =
+                [[MeetingSystemAudioCaptureSession alloc] initWithCallback:callback
+                                                                  userData:user_data];
             std::string error;
-            NSString *tap_uid = nil;
-            if (!get_tap_uid(handle->tap_id, &tap_uid, error)) {
+            if (![session startWithErrorMessage:error]) {
                 set_error(error_buffer, error_buffer_len, error);
-                meeting_system_audio_stop(handle);
                 return false;
             }
 
-            AudioStreamBasicDescription format = {};
-            if (!get_tap_format(handle->tap_id, format, error)) {
-                set_error(error_buffer, error_buffer_len, error);
-                meeting_system_audio_stop(handle);
-                return false;
-            }
-            handle->sample_rate_hz = static_cast<uint32_t>(std::llround(format.mSampleRate));
-            handle->channels =
-                static_cast<uint16_t>(std::min<UInt32>(format.mChannelsPerFrame, UINT16_MAX));
-
-            NSString *aggregate_uid = [NSString stringWithFormat:
-                @"com.cxc.meeting.system-audio.%@",
-                [[NSUUID UUID] UUIDString]];
-            NSDictionary *tap_entry = @{
-                dictionary_key(kAudioSubTapUIDKey): tap_uid,
-            };
-            NSDictionary *aggregate_description = @{
-                dictionary_key(kAudioAggregateDeviceUIDKey): aggregate_uid,
-                dictionary_key(kAudioAggregateDeviceNameKey): @"Meeting System Audio",
-                dictionary_key(kAudioAggregateDeviceIsPrivateKey): @YES,
-                dictionary_key(kAudioAggregateDeviceTapListKey): @[ tap_entry ],
-                dictionary_key(kAudioAggregateDeviceTapAutoStartKey): @YES,
-            };
-
-            status = AudioHardwareCreateAggregateDevice(
-                (__bridge CFDictionaryRef)aggregate_description,
-                &handle->aggregate_device_id);
-            if (status != noErr) {
-                set_error(
-                    error_buffer,
-                    error_buffer_len,
-                    osstatus_message("AudioHardwareCreateAggregateDevice", status));
-                meeting_system_audio_stop(handle);
-                return false;
-            }
-
-            status = AudioDeviceCreateIOProcID(
-                handle->aggregate_device_id,
-                system_audio_io_proc,
-                handle,
-                &handle->io_proc_id);
-            if (status != noErr) {
-                set_error(
-                    error_buffer,
-                    error_buffer_len,
-                    osstatus_message("AudioDeviceCreateIOProcID", status));
-                meeting_system_audio_stop(handle);
-                return false;
-            }
-
-            status = AudioDeviceStart(handle->aggregate_device_id, handle->io_proc_id);
-            if (status != noErr) {
-                set_error(
-                    error_buffer,
-                    error_buffer_len,
-                    osstatus_message("AudioDeviceStart", status));
-                meeting_system_audio_stop(handle);
-                return false;
-            }
-
-            handle->started = true;
-            *out_handle = handle;
+            *out_handle = (__bridge_retained void *)session;
             return true;
-        } else {
-            set_error(
-                error_buffer,
-                error_buffer_len,
-                "macOS system audio capture requires macOS 14.2 or newer");
-            return false;
         }
+
+        set_error(
+            error_buffer,
+            error_buffer_len,
+            "macOS system audio capture requires ScreenCaptureKit audio capture");
+        return false;
     }
 }
 
@@ -353,30 +508,9 @@ extern "C" void meeting_system_audio_stop(void *raw_handle) {
         return;
     }
 
-    auto *handle = static_cast<MeetingSystemAudioHandle *>(raw_handle);
-    if (handle->started && handle->aggregate_device_id != kAudioObjectUnknown) {
-        OSStatus status = AudioDeviceStop(handle->aggregate_device_id, handle->io_proc_id);
-        log_teardown_status("AudioDeviceStop", status);
-        handle->started = false;
+    @autoreleasepool {
+        MeetingSystemAudioCaptureSession *session =
+            (__bridge_transfer MeetingSystemAudioCaptureSession *)raw_handle;
+        [session stop];
     }
-    if (handle->io_proc_id != nullptr && handle->aggregate_device_id != kAudioObjectUnknown) {
-        OSStatus status =
-            AudioDeviceDestroyIOProcID(handle->aggregate_device_id, handle->io_proc_id);
-        log_teardown_status("AudioDeviceDestroyIOProcID", status);
-        handle->io_proc_id = nullptr;
-    }
-    if (handle->aggregate_device_id != kAudioObjectUnknown) {
-        OSStatus status = AudioHardwareDestroyAggregateDevice(handle->aggregate_device_id);
-        log_teardown_status("AudioHardwareDestroyAggregateDevice", status);
-        handle->aggregate_device_id = kAudioObjectUnknown;
-    }
-    if (handle->tap_id != kAudioObjectUnknown) {
-        if (@available(macOS 14.2, *)) {
-            OSStatus status = AudioHardwareDestroyProcessTap(handle->tap_id);
-            log_teardown_status("AudioHardwareDestroyProcessTap", status);
-        }
-        handle->tap_id = kAudioObjectUnknown;
-    }
-
-    delete handle;
 }
